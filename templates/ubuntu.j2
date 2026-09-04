@@ -1,0 +1,224 @@
+{% extends '_base.j2' %}
+
+{% set marker_name = marker_name | default('ubuntu') %}
+{% set display_name = display_name | default('Ubuntu') %}
+{% set default_session = 'ubuntu' %}
+
+{% set user_groups = user_groups | default(['sudo', 'audio', 'video', 'plugdev', 'netdev']) %}
+{% set gdm_service = 'gdm3.service' %}
+
+{% set _chrome_install_cmd = 'apt-get install -y google-chrome-stable' %}
+
+{%- set guest_agent_packages = ['spice-vdagent'] %}
+{%- set vmtools_service = '' %}
+{%- set extra_enable_services = ['spice-vdagentd.service'] %}
+
+{% set plymouth_theme = 'spinner' %}
+{% set plymouth_set_theme = 'update-alternatives --set default.plymouth /usr/share/plymouth/themes/spinner/spinner.plymouth' %}
+{% set plymouth_grub_args = 'splash quiet video=3456x2234@60' %}
+{% set plymouth_grub_regen = 'update-grub' %}
+{% set plymouth_initrd_regen = 'update-initramfs -u' %}
+
+{% set _apt_dns_probe_host = 'archive.ubuntu.com' %}
+{% set _apt_no_bloat_pkgs = [
+  "nvidia-*", "linux-firmware-*", "firmware-iwlwifi", "firmware-atheros",
+  "firmware-brcm80211", "firmware-libertas", "firmware-misc-nonfree",
+  "firmware-realtek", "firmware-amd-graphics", "hpijs-ppds", "hplip*",
+] %}
+
+{% set dconf_wallpaper_find = 'ls /usr/share/backgrounds/*-final-ubuntu.png /usr/share/backgrounds/ubuntu-default-*.png /usr/share/backgrounds/warty-final-ubuntu.png 2>/dev/null | head -1' %}
+
+{% set _apt_core_pkgs = [
+  "gdm3",
+  "gnome-themes-extra",
+  "xdg-desktop-portal-gnome",
+  "plymouth",
+  "sound-theme-freedesktop",
+  "gnome-tweaks",
+  "gnome-software",
+  "gnome-software-plugin-flatpak",
+  "gnome-console",
+  "gnome-text-editor",
+  "yelp",
+  "gnome-weather",
+  "gnome-calendar",
+  "gnome-sound-recorder",
+  "pipewire",
+  "pipewire-pulse",
+  "pipewire-alsa",
+  "pipewire-jack",
+  "wireplumber",
+  "libspa-0.2-bluetooth",
+  "rtkit",
+  "bluez",
+  "gnome-extensions-app",
+  "usbutils",
+  "gvfs-backends",
+  "pcscd",
+  "flatpak",
+  "snapd",
+  "mesa-vulkan-drivers",
+  "vulkan-tools",
+  "mesa-utils",
+  "rclone",
+  "git",
+  "nano",
+  "fastfetch",
+  "net-tools",
+  "fonts-firacode",
+  "epiphany-browser",
+  "totem",
+  "loupe",
+  "gnome-snapshot",
+  "papers",
+  "geary",
+  "python3-pip",
+  "python3-venv",
+  "sysprof",
+  "lsb-release",
+] %}
+
+{% set _apt_pkgs = [
+    "ubuntu-desktop-minimal",
+    "ubuntu-wallpapers",
+    "plymouth-theme-spinner",
+] %}
+
+{% block bootcmd %}
+  - [ cloud-init-per, once, disable-needrestart, bash, -c,
+      "{ date -Iseconds; echo '=== bootcmd: disable-needrestart ==='; set -ex;
+         printf '$nrconf{restart} = \"n\";\\n' > /etc/needrestart/needrestart.conf 2>/dev/null || true;
+         echo 'needrestart configured to skip restarts';
+         date -Iseconds;
+      } >>/var/log/cloud-init-bootcmd.log 2>&1" ]
+  - [ cloud-init-per, once, fix-dns, bash, -c,
+      "{ date -Iseconds; echo '=== bootcmd: fix-dns ==='; set -ex;
+         if ! getent hosts {{ _apt_dns_probe_host }} >/dev/null 2>&1; then
+           rm -f /etc/resolv.conf;
+           printf 'nameserver 8.8.8.8\\nnameserver 1.1.1.1\\n' > /etc/resolv.conf;
+           chmod 644 /etc/resolv.conf;
+           echo 'DNS fixed -- wrote static resolv.conf';
+         else
+           echo 'DNS working -- no fix needed';
+         fi;
+         date -Iseconds;
+      } >>/var/log/cloud-init-bootcmd.log 2>&1" ]
+  - [ cloud-init-per, once, exclude-firmware-printing, bash, -c,
+      "{ date -Iseconds; echo '=== bootcmd: exclude-firmware-printing ==='; set -ex;
+         printf 'Package: {{ _apt_no_bloat_pkgs | join(' ') }}\\nPin: release *\\nPin-Priority: -1\\n' > /etc/apt/preferences.d/99-no-bloat.pref;
+          echo 'Pin policy installed';
+          date -Iseconds;
+       } >>/var/log/cloud-init-bootcmd.log 2>&1" ]
+  - [ cloud-init-per, once, apt-no-langs, bash, -c,
+      "{ date -Iseconds; echo '=== bootcmd: apt-no-langs ==='; set -ex;
+         printf 'Acquire::Languages \"none\";\\n' > /etc/apt/apt.conf.d/99-no-language-downloads;
+         echo 'apt translations download disabled';
+         date -Iseconds;
+      } >>/var/log/cloud-init-bootcmd.log 2>&1" ]
+  - [ cloud-init-per, once, generate-en-locales, bash, -c,
+      "{ date -Iseconds; echo '=== bootcmd: generate-en-locales ==='; set -ex;
+          sed -i 's/^# \\(en_ZA\\.UTF-8 UTF-8\\)/\\1/; s/^# \\(en_GB\\.UTF-8 UTF-8\\)/\\1/; s/^# \\(en_US\\.UTF-8 UTF-8\\)/\\1/' /etc/locale.gen;
+          locale-gen;
+          echo 'en_ZA + en_GB + en_US locales generated';
+          date -Iseconds;
+      } >>/var/log/cloud-init-bootcmd.log 2>&1" ]
+  - [ cloud-init-per, once, google-chrome-repo, bash, -c,
+      "{ date -Iseconds; echo '=== bootcmd: google-chrome-repo ==='; set -ex;
+         mkdir -p /usr/share/keyrings;
+         python3 -c 'import urllib.request,base64; d=urllib.request.urlopen(\"https://dl.google.com/linux/linux_signing_key.pub\").read().decode(); b=d.split(\"-----\")[2]; b=\"\".join(x for x in b.splitlines() if x and not x.startswith(\"=\") and \":\" not in x); open(\"/usr/share/keyrings/google-chrome.gpg\",\"wb\").write(base64.b64decode(b))' || true;
+         printf 'deb [arch={{ 'arm64' if GUEST_ARCH == 'aarch64' else 'amd64' }} signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main\\n' > /etc/apt/sources.list.d/google-chrome.list;
+         echo 'Google Chrome repo registered';
+         date -Iseconds;
+      } >>/var/log/cloud-init-bootcmd.log 2>&1" ]
+{% endblock %}
+
+{% block pre_runcmd %}
+  - [ sh, -c, "systemctl disable --now systemd-networkd.service systemd-networkd.socket 2>/dev/null || true; rm -f /etc/systemd/network/*.network 2>/dev/null || true; systemctl enable --now NetworkManager.service || true" ]
+{% endblock %}
+
+{% block packages %}
+{% for p in guest_agent_packages %}
+  - {{ p }}
+{% endfor %}
+{% for p in _apt_core_pkgs %}
+{% if p not in ['mesa-vulkan-drivers', 'vulkan-tools', 'mesa-utils'] %}
+  - {{ p }}
+{% endif %}
+{% endfor %}
+{% for p in _apt_pkgs %}
+  - {{ p }}
+{% endfor %}
+{% endblock %}
+
+{% block post_runcmd %}
+  - [ sh, -c, "apt-get update 2>&1 | tail -5 || true" ]
+  - [ sh, -c, "dpkg -l gdm3 2>/dev/null | grep -q '^ii' || { echo 'WARN: gdm3 not installed -- attempting reinstall'; apt-get install -y gdm3 2>&1 | tail -5 || true; }; systemctl enable --now gdm3.service 2>&1 || true" ]
+  {% include '_dconf_common.j2' %}
+  {% include '_plymouth_common.j2' %}
+  {% include '_app_platforms_common.j2' %}
+  {% include '_gs_extensions_common.j2' %}
+  # ---- Snap packages: snapd, snap-store, bingwall ----
+  - [ bash, -c,
+      "{ date -Iseconds; echo '=== post_runcmd: install snaps ==='; set -ex;
+         snap wait system seed.loaded || true;
+         snap install snap-store 2>&1 | tail -3 || echo 'SNAP-STORE-FAIL';
+         snap install bingwall 2>&1 | tail -3 || echo 'BINGWALL-FAIL';
+         snap list 2>&1 | grep -E 'snap-store|bingwall' || echo 'SNAPS-MISSING';
+         echo 'SNAPS-OK';
+         date -Iseconds;
+      } >>/var/log/cloud-init-output.log 2>&1" ]
+  # ---- Custom mesa from fork: replace distro mesa with miles.buckton fork ----
+  - [ bash, -c,
+      "{ date -Iseconds; echo '=== post_runcmd: build custom mesa ==='; set -ex;
+         ARCH=$(dpkg --print-architecture);
+         echo \"Building custom mesa for $ARCH\";
+         apt-get install -y meson ninja-build python3-mako libdrm-dev libxcb-dri3-dev libxcb-present-dev libxcb-keysyms1-dev libpciaccess-dev libelf-dev libexpat1-dev libxcb-glx0-dev libxcb-shm0-dev libxcb-icccm4-dev libxcb-image0-dev libxcb-shm0-dev libxcb-sync-dev libxcb-xfixes0-dev libxcb-xinerama0-dev libxcb-xkb-dev libxkbcommon-dev libxkbcommon-x11-dev libopengl0 libopengl0-dev libglx0 libglx0-dev libgbm-dev libsensors4-dev libwayland-dev wayland-protocols python3-pip python3-venv xutils-dev bison flex texinfo 2>&1 | tail -5 || true;
+         rm -rf /tmp/mesa-src;
+         git clone --depth 1 https://gitlab.freedesktop.org/miles.buckton/mesa.git /tmp/mesa-src 2>&1 | tail -3;
+         cd /tmp/mesa-src;
+         rm -rf builddir;
+         meson setup builddir --prefix=/usr -Dplatforms=x11,wayland -Dgallium-drivers=virgl,llvmpipe -Dllvm=enabled -Dshared-llvm=enabled -Dvulkan-drivers=swrast -Dbuildtype=release 2>&1 | tail -10;
+         ninja -C builddir -j$(nproc) 2>&1 | tail -10;
+         ninja -C builddir install 2>&1 | tail -5;
+         ldconfig;
+         echo 'MESA-FORK-OK: custom mesa installed from miles.buckton fork';
+         date -Iseconds;
+      } >>/var/log/cloud-init-output.log 2>&1" ]
+{% endblock %}
+
+{% block simulate_install %}
+  - [ sh, -c, "set -e ;
+      for i in 1 2 3; do apt-get update >/dev/null 2>&1 && break; sleep $((i * 5)); done || true ;
+      PKGS=$(tr '\\n' ' ' < /etc/install-simulate-pkgs.txt) ;
+      if apt-get install --simulate -y $PKGS > /var/log/install-simulate.log 2>&1 ; then
+        echo 'SIMULATE-OK: apt resolver passed for full target list' ;
+      else
+        echo 'SIMULATE-FAIL: apt resolver could not satisfy the target list (see /var/log/install-simulate.log for details)' ;
+        tail -40 /var/log/install-simulate.log ;
+        exit 1 ;
+      fi" ]
+{% endblock %}
+
+{% block extra_write_files %}
+{% if simulate_only %}
+  - path: /etc/install-simulate-pkgs.txt
+    permissions: "0644"
+    content: |
+{% for p in guest_agent_packages %}
+      {{ p }}
+{% endfor %}
+{% for p in _apt_core_pkgs %}
+{% if p not in ['mesa-vulkan-drivers', 'vulkan-tools', 'mesa-utils'] %}
+      {{ p }}
+{% endif %}
+{% endfor %}
+{% for p in _apt_pkgs %}
+      {{ p }}
+{% endfor %}
+      google-chrome-stable
+{% endif %}
+{% endblock %}
+
+{% block verify %}
+{{ verify_gate_apt() }}
+{% endblock %}

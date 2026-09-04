@@ -1,0 +1,711 @@
+{% extends '_base.j2' %}
+
+{% set marker_name = marker_name | default('gentoo') %}
+{% set display_name = display_name | default('Gentoo') %}
+{% set gdm_service = 'gdm.service' %}
+{% set skip_gdm_enable = true %}
+{% set user_groups = user_groups | default(['wheel', 'audio', 'video', 'input']) %}
+{%- set guest_agent_packages = [] %}
+{%- set vmtools_service = '' %}
+{%- set extra_enable_services = [] %}
+
+{# Google Chrome -- not in the main Gentoo tree. Attempt via the gentoo
+   overlay. Best-effort: the overlay may not be available, in which case
+   the install fails gracefully and CHROME-MISSING is emitted. #}
+{% set _chrome_install_cmd = 'eselect repository enable gentoo 2>/dev/null && emerge --getbinpkgonly --verbose www-client/google-chrome 2>&1 | tail -5' %}
+
+{# Plymouth -- Gentoo's default splash is the "charge" theme (same as
+   Fedora). Plymouth bootsplash on Gentoo uses dracut for initrd regen
+   and GRUB for cmdline. #}
+{% set plymouth_theme = 'charge' %}
+{% set plymouth_grub_var = 'GRUB_CMDLINE_LINUX_DEFAULT' %}
+{% set plymouth_grub_args = 'splash quiet video=3456x2234@60' %}
+{% set plymouth_grub_regen = 'grub2-mkconfig -o /boot/grub/grub.cfg 2>/dev/null || true' %}
+{% set plymouth_initrd_regen = 'dracut -f 2>/dev/null || true' %}
+
+{# Gentoo package atoms -- full category/name for unambiguous resolution.
+   gnome-base/gnome is the meta-package that pulls in gnome-shell, gdm,
+   gnome-control-center, nautilus, etc. from the desktop/gnome/systemd
+   profile's @world set. gnome-software IS installed on Gentoo (it has no
+   arm64 binpkg and pulls xorg-drivers, which also has no arm64 binpkg, so
+   it forces a source build of the X11 stack. The individual
+   apps below are explicit for cross-distro parity (installed by
+   gentoo-install.service from the binhost where available). #}
+ {% set _gentoo_pkgs = [
+   "gnome-base/gnome",
+   "gnome-base/gdm",
+   "gnome-base/gnome-control-center",
+   "gnome-base/nautilus",
+   "gnome-extra/gnome-software",
+   "sys-apps/flatpak",
+   "gui-apps/gnome-console",
+   "app-editors/gnome-text-editor",
+   "gnome-extra/gnome-tweaks",
+   "gnome-extra/gnome-shell-extensions",
+   "gnome-extra/gnome-weather",
+   "gnome-extra/gnome-calendar",
+   "gnome-extra/yelp",
+   "net-wireless/bluez",
+   "net-wireless/gnome-bluetooth",
+   "media-video/pipewire",
+   "media-video/wireplumber",
+    "media-libs/vulkan-loader",
+    "dev-util/vulkan-tools",
+    "x11-apps/mesa-progs",
+   "media-fonts/fira-code",
+   "app-editors/nano",
+   "sys-apps/net-tools",
+   "dev-vcs/git",
+   "dev-python/pip",
+   "media-video/totem",
+    "app-text/papers",
+   "mail-client/geary",
+   "www-client/epiphany",
+   "gnome-base/gvfs",
+   "net-libs/gnome-online-accounts",
+   "x11-themes/sound-theme-freedesktop",
+    "x11-themes/gnome-backgrounds",
+    "x11-themes/adwaita-icon-theme",
+    "x11-themes/gnome-icon-theme-symbolic",
+    "x11-themes/gnome-themes-standard",
+   "net-misc/networkmanager",
+   "sys-boot/plymouth",
+   "gnome-extra/gnome-calculator",
+   "gnome-extra/gnome-system-monitor",
+   "media-gfx/gnome-screenshot",
+   "sys-apps/gnome-disk-utility",
+    "gnome-extra/gnome-contacts",
+     "gnome-extra/gnome-characters",
+    "media-sound/gnome-sound-recorder",
+      "media-plugins/alsa-plugins",
+      "sys-apps/usbutils",
+     "sys-auth/rtkit",
+     "sys-apps/pcsc-lite",
+     "sys-apps/lsb-release",
+     "app-misc/fastfetch",
+     "net-misc/rclone",
+     "dev-util/sysprof",
+     "media-gfx/loupe",
+       "sys-apps/xdg-desktop-portal-gnome",
+       "sys-apps/portage-utils",
+       "dev-build/cmake",
+       "dev-build/ninja",
+      ] %}
+
+{% block packages %}
+  # Gentoo's cloud-init does not natively handle Portage. Package
+  # installation is handled entirely in runcmd via emerge. The
+  # packages: block is intentionally left empty.
+{% endblock %}
+
+{% block cloud_init_wiring %}
+# Gentoo's cloud-init network module HANGS indefinitely trying to apply the
+# netplan v2 `network-config` seed (which Gentoo does not support) -- this
+# blocks cloud-init before bootcmd/runcmd, so no SSH user and no install ever
+# start. Disable cloud-init's network handling entirely; bootcmd below brings
+# NOTE: `network`/`datasource_list` are intentionally NOT set here. They are
+# NOT valid top-level cloud-config keys (cloud-init rejects them with a schema
+# error that aborts the entire bootcmd module). The NoCloud datasource and the
+# network-config are supplied by the seed ISO (meta-data + network-config),
+# which is what makes cloud-init finish quickly instead of hanging on a network
+# metadata service.
+{% endblock %}
+
+{% block bootcmd %}
+  # Enable sshd EARLY, in the background, so the guest is reachable even if a
+  # later bootcmd stage (e.g. the Portage tree sync) hangs. sshd does not
+  # depend on the tree being present, and the user-data already authorizes the
+  # SSH key. This survives a stuck sync and lets us debug from the host.
+  - [ sh, -c, "nohup sh -c 'ssh-keygen -A >/dev/null 2>&1 || true; systemctl mask --now sshd.service sshd.socket ssh.service ssh.socket 2>/dev/null || true; grep -q \"UseDNS no\" /etc/ssh/sshd_config 2>/dev/null || printf \"\\n# fleet: keep SSH reachable under QEMU usernet\\nUseDNS no\\nGSSAPIAuthentication no\\n\" >> /etc/ssh/sshd_config; /usr/sbin/sshd 2>/dev/null || true; echo sshd-early-done' >/tmp/sshd-early.log 2>&1 &' ; systemctl enable --now early-ssh.service 2>/dev/null || true; systemctl enable --now gentoo-install.service 2>/dev/null || true; echo 'sshd + install services dispatched'" ]
+  # Network bring-up -- Gentoo cloud images ship cloud-init with
+  # `network: config: disabled` so the netplan v2 network-config from the
+  # seed ISO is never applied.  systemd-networkd is running but has no
+  # .network file for the QEMU virtio NIC (enp0s3).  We drop a DHCP
+  # config, restart networkd, and wait for a lease before anything else
+   # runs.  (NetworkManager is installed for GNOME's network panel and
+   # will be enabled as the final step of the install service, but is
+   # left disabled during the build to avoid the lease/DNS loss that
+   # stalled emerge.  At this bootcmd stage networkd
+   # is also the only stack up.)
+  - [ bash, -c,
+      "{ date -Iseconds; echo '=== bootcmd: bring-up-network ==='; set -ex;
+         IFACE=$(ls /sys/class/net/ | grep -v lo | head -1);
+         echo \"Detected NIC: $IFACE\";
+         mkdir -p /etc/systemd/network;
+          printf '[Match]\\nName=%s\\n\\n[Network]\\nDHCP=yes\\n' \"$IFACE\" > /etc/systemd/network/10-dhcp.network;
+         systemctl restart systemd-networkd.service 2>&1 | tail -3;
+         for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+           if ip addr show $IFACE | grep -q 'inet '; then
+             echo \"Networking up on $IFACE\";
+             ip addr show $IFACE | grep inet;
+             break;
+           fi;
+           sleep 2;
+         done;
+         date -Iseconds;
+      } >>/var/log/cloud-init-bootcmd.log 2>&1" ]
+  # DNS: Gentoo cloud images ship a broken symlink (resolv.conf →
+  # ../run/systemd/resolve/stub-resolv.conf) that never resolves because
+  # systemd-resolved never populates the stub.  The probe was skipped on
+  # every previous build because `getent hosts` succeeded at boot (via
+  # nsswitch or transient state) but failed later during the multi-hour
+  # emerge, causing every source tarball download to abort.  Fix:
+  # unconditionally replace the symlink with a real file, and drop a
+  # systemd-resolved override so DNS survives NM / service restarts.
+  - [ bash, -c,
+      "{ date -Iseconds; echo '=== bootcmd: fix-dns ==='; set -ex;
+         rm -f /etc/resolv.conf;
+         printf '%s\\n' 'nameserver 8.8.8.8' 'nameserver 1.1.1.1' 'nameserver 10.0.2.3' > /etc/resolv.conf;
+         mkdir -p /etc/systemd/resolved.conf.d;
+         cat > /etc/systemd/resolved.conf.d/nameservers.conf <<'DROPIN'
+[Resolve]
+DNS=8.8.8.8 1.1.1.1 10.0.2.3
+FallbackDNS=8.8.4.4 1.0.0.1
+DNSSEC=no
+DNSOverTLS=no
+DROPIN
+         systemctl restart systemd-resolved.service 2>&1 | tail -3 || true;
+         getent hosts distfiles.gentoo.org >/dev/null 2>&1 && echo 'DNS OK' || echo 'DNS STILL BROKEN';
+         cat /etc/resolv.conf;
+         date -Iseconds;
+      } >>/var/log/cloud-init-bootcmd.log 2>&1" ]
+  # NOTE: The Portage tree sync + profile + binhost config + GNOME install are
+  # intentionally NOT done here. cloud-init runs bootcmd as a single blocking
+  # stage, and the tree sync can hang (unreliable rsync) which would hold the
+  # bootcmd lock and prevent sshd from coming up. Instead, a standalone
+  # systemd service (gentoo-install.service, written via extra_write_files and
+  # enabled in pre_runcmd) performs the sync+install AFTER sshd is up, fully
+  # decoupled from cloud-init. bootcmd here only does the minimal network/DNS
+  # prep the service needs.
+  - [ bash, -c,
+       "{ date -Iseconds; echo '=== bootcmd: mark-ready ==='; echo 'bootcmd minimal prep done'; date -Iseconds;        } >>/var/log/cloud-init-bootcmd.log 2>&1" ]
+  # Generate en_ZA.UTF-8 (default), en_GB.UTF-8, en_US.UTF-8 BEFORE
+  # cloud-init's cc_locale module runs.
+  - [ bash, -c,
+      "{ date -Iseconds; echo '=== bootcmd: generate-en-locales ==='; set -ex;
+         sed -i 's/^# \\(en_ZA\\.UTF-8 UTF-8\\)/\\1/; s/^# \\(en_GB\\.UTF-8 UTF-8\\)/\\1/; s/^# \\(en_US\\.UTF-8 UTF-8\\)/\\1/' /etc/locale.gen 2>/dev/null || true;
+         locale-gen 2>&1 | tail -5 || true;
+         echo 'en_ZA + en_GB + en_US locales generated';
+         date -Iseconds;
+      } >>/var/log/cloud-init-bootcmd.log 2>&1" ]
+{% endblock %}
+
+{% block pre_runcmd %}
+   # Explicitly enable + start sshd so the guest is reachable over SSH even if
+  # cloud-init's default ssh handling differs on this image. The SSH key is
+  # already authorized via the user-data; this just guarantees the daemon is up.
+  - [ sh, -c, "/usr/local/sbin/fleet-ensure-ssh.sh; echo 'sshd ensured (daemon, distro units masked)'" ]
+  # Keep systemd-networkd as the active manager during the build. bootcmd
+  # already brought the link up via systemd-networkd and obtained a stable
+  # DHCP lease from QEMU's usermode SLIRP (gateway 10.0.2.2). Switching to
+  # NetworkManager mid-build disturbed the guest IP / the SLIRP forward to
+  # :22 and stalled the emerge. NetworkManager IS installed
+  # (for GNOME's panel) and will be enabled as the final step of the install
+  # service (after all emerges complete), aligning Gentoo with Debian/Ubuntu/
+  # Fedora. During the build, only networkd manages the interface.
+  - [ sh, -c, "systemctl enable --now systemd-networkd.service 2>/dev/null || true; for i in 1 2 3 4 5 6 7 8 9 10; do if ip addr show | grep -q 'inet '; then echo 'networkd has a lease'; break; fi; sleep 2; done" ]
+  # Harden DNS: keep a STATIC resolv.conf (8.8.8.8 / 1.1.1.1 / 10.0.2.3) so a
+  # flapping lease DNS cannot break emerge / curl / flatpak. Restart
+  # systemd-resolved (the resolver under networkd), not NetworkManager.
+  - [ sh, -c, "printf '%s\\n' 'nameserver 8.8.8.8' 'nameserver 1.1.1.1' 'nameserver 10.0.2.3' > /etc/resolv.conf; systemctl restart systemd-resolved.service 2>/dev/null || true; echo 'DNS hardened (static resolv.conf)'" ]
+  # Enable + start early-ssh and gentoo-install NOW. write_files (extra_write_files)
+  # has already created both unit files by this point in cloud-init's module
+  # order (bootcmd runs BEFORE write_files, so enabling them there silently
+  # no-ops and the install never runs). early-ssh hardens sshd (UseDNS no,
+  # Restart=always) so the fleet's SSH probes succeed; gentoo-install performs
+  # the actual Portage tree sync + GNOME emerge.
+  - [ sh, -c, "systemctl enable --now early-ssh.service 2>/dev/null || true; systemctl enable --now gentoo-install.service 2>/dev/null || true; echo 'early-ssh and gentoo-install services enabled after write_files'" ]
+{% endblock %}
+
+{% block post_runcmd %}
+  # Console-visible progress markers (the serial console is captured to
+  # console.log on the host, so the orchestrator can watch emerge live even
+  # when sshd is starved by the install). Echo to /dev/console as well as
+  # the log so they appear in the QEMU serial capture.
+  - [ sh, -c, "echo 'GENTOO-EMERGE-START'; echo 'GENTOO-EMERGE-START' >/dev/console 2>/dev/null || true" ]
+  # Install GNOME desktop meta-package. Uses --getbinpkg (binary preferred,
+  # source fallback) so a missing binpkg compiles from source instead of
+  # NOTE: The actual GNOME install (sync + profile + binhost + emerge) is
+  # performed by the standalone gentoo-install.service (written via
+  # extra_write_files, started in pre_runcmd), which runs AFTER sshd is up and
+  # is fully decoupled from cloud-init's bootcmd lock. Here we only (1) emit a
+  # marker, (2) wait for that service to finish, then (3) verify + start GDM.
+  - [ sh, -c, "echo 'GENTOO-INSTALL-START (delegated to gentoo-install.service)'; echo 'GENTOO-INSTALL-START' >/dev/console 2>/dev/null || true" ]
+  # Wait (bounded ~240 min) for the install service to complete. gnome-software
+  # has no arm64 binpkg and pulls xorg-drivers (also no binpkg), forcing a
+  # ~1.5-2.5h X11 source build; the wait must exceed that so the
+  # orchestrator's success marker only fires once the desktop is installed.
+  - [ sh, -c, "for i in $(seq 1 600); do if [ -f /var/lib/gentoo-install-done ]; then echo 'gentoo-install.service reported done'; break; fi; sleep 30; done; [ -f /var/lib/gentoo-install-done ] || echo 'WARNING: install service did not finish within timeout'" ]
+  # Start GDM once the desktop is installed.
+  - [ sh, -c, "systemctl enable --now gdm.service 2>&1 || true" ]
+  # dconf: wallpaper, dark mode, single workspace, Epiphany webextensions,
+  # event sounds. Gentoo's dconf uses the same system-db mechanism.
+  {% set dconf_wallpaper_find = "find /usr/share/backgrounds/ -maxdepth 2 -type f \\\\( -name '*.png' -o -name '*.jpg' -o -name '*.jxl' \\\\) 2>/dev/null | head -1" %}
+    {% include '_dconf_common.j2' %}
+   {% include '_app_platforms_common.j2' %}
+  # GNOME Shell extensions -- Gentoo packages none of these for arm64
+  # (dash-to-dock's ebuild lacks the arm64 keyword), so all six come from
+  # tagged GitHub-release zips, best-effort. Enabled via _dconf_common.
+  {% include '_gs_extensions_common.j2' %}
+  # GNOME Snapshot (camera) is still NOT packaged in the Gentoo tree (no
+  # has no media-gfx/snapshot ebuild) -- install it from Flathub
+  # best-effort. Loupe (image viewer) IS now in the tree (media-gfx/loupe,
+  # ~arm64-keyworded; unmasked via package.accept_keywords and installed
+  # natively by the gentoo-install.sh PKGS list), so its Flathub copy was
+  # dropped -- same native-install path as the other 3 distros. The flathub
+  # remote is registered by the shared _app_platforms_common.j2 include above.
+  # Marker: SNAPSHOT-FLATPAK-OK/MISSING.
+  - [ sh, -c, "for attempt in 1 2 3; do flatpak install -y flathub org.gnome.Snapshot > /tmp/flatpak-snapshot.log 2>&1 && { echo 'SNAPSHOT-FLATPAK-OK: org.gnome.Snapshot installed from Flathub (attempt $attempt)'; break; }; echo \"flatpak Snapshot install attempt $attempt failed; retrying\"; sleep $((attempt * 30)); done; flatpak list --app --columns=application 2>/dev/null | grep -q 'org.gnome.Snapshot' || echo 'SNAPSHOT-FLATPAK-MISSING: org.gnome.Snapshot not installed after 3 attempts (Flathub unreachable?)'" ]
+{% endblock %}
+
+{% block simulate_install %}
+  # SIMULATE: seed the Portage tree + profile (mirrors gentoo-install.service
+  # but cheaply -- no real install), then emerge --pretend (dry-run) against the
+  # full target list. Validates that the resolver can satisfy the install set
+  # from the binhost. Without the tree/profile, emerge has nothing to resolve
+  # against (bootcmd is skipped in simulate mode, so it cannot do this).
+  - [ sh, -c, "set -e ;
+       echo \"=== simulate: harden DNS (keep static resolv.conf; networkd, not NM) ===\" ;
+       rm -f /etc/resolv.conf ;
+       printf '%s\n' 'nameserver 8.8.8.8' 'nameserver 1.1.1.1' 'nameserver 10.0.2.3' > /etc/resolv.conf ;
+       systemctl restart systemd-resolved.service 2>/dev/null || true ;
+       for i in $(seq 1 10); do ip addr show | grep -q 'inet ' && break; sleep 2; done ;
+       rm -f /etc/resolv.conf ;
+       printf '%s\n' 'nameserver 8.8.8.8' 'nameserver 1.1.1.1' 'nameserver 10.0.2.3' > /etc/resolv.conf ;
+       { echo '--- resolv.conf ---'; cat /etc/resolv.conf; echo '--- getent distfiles.gentoo.org ---'; getent hosts distfiles.gentoo.org || echo 'STILL-FAIL'; } >> /var/log/install-simulate.log 2>&1 ;
+       ARCH=$(uname -m) ; [ \"$ARCH\" = \"aarch64\" ] && GENTOO_ARCH=arm64 || GENTOO_ARCH=amd64 ;
+        echo \"=== simulate: seed portage tree (git shallow clone primary, rsync/tarball fallback) ===\" ;
+       for i in $(seq 1 20); do ip addr show | grep -q 'inet ' && break; sleep 3; done ;
+       install -d -o portage -g portage /var/db/repos/gentoo ;
+       ok=0 ;
+       if ! command -v git >/dev/null 2>&1; then echo \"installing dev-vcs/git from binhost/bundled tree\" ; timeout 900 emerge --getbinpkg --verbose dev-vcs/git 2>&1 | tail -3 || true ; fi ;
+       if command -v git >/dev/null 2>&1; then
+         printf '[gentoo]\\nlocation = /var/db/repos/gentoo\\nsync-type = git\\nsync-uri = https://github.com/gentoo-mirror/gentoo.git\\nsync-depth = 1\\nsync-git-verify-commit-signature = false\\n' > /etc/portage/repos.conf/gentoo.conf ;
+         timeout 300 emaint sync -r gentoo 2>&1 | tail -3 && { [ -d /var/db/repos/gentoo/profiles ] && ok=1; } ;
+       fi ;
+       if [ \"$ok\" != \"1\" ]; then
+         rm -f /etc/portage/repos.conf/gentoo.conf ;
+         timeout 300 emaint sync -r gentoo 2>&1 | tail -3 && { [ -d /var/db/repos/gentoo/profiles ] && ok=1; } ;
+       fi ;
+      if [ \"$ok\" != \"1\" ]; then
+        rm -rf /var/db/repos/gentoo && mkdir -p /var/db/repos/gentoo ;
+        timeout 300 wget -q https://distfiles.gentoo.org/snapshots/portage-latest.tar.xz -O /tmp/portage-latest.tar.xz && \\
+        tar -xJf /tmp/portage-latest.tar.xz -C /var/db/repos/gentoo --strip-components=1 && ok=1 ;
+      fi ;
+      echo \"tree sync ok=$ok\" ;
+      eselect profile set default/linux/$GENTOO_ARCH/23.0/desktop/gnome/systemd 2>&1 | tail -2 || true ;
+      mkdir -p /etc/portage/binrepos.conf ;
+      printf '[gentoo]\\npriority = 9999\\nsync-uri = https://distfiles.gentoo.org/releases/%s/binpackages/23.0/%s\\nverify-signature = true\\nlocation = /var/cache/binhost/gentoo\\n' \"$GENTOO_ARCH\" \"$GENTOO_ARCH\" > /etc/portage/binrepos.conf/gentoo.conf ;
+      grep -q 'getbinpkg' /etc/portage/make.conf 2>/dev/null || printf '\\nFEATURES=\"${FEATURES} getbinpkg\"\\n' >> /etc/portage/make.conf ;
+       grep -q 'PYTHON_TARGETS=' /etc/portage/make.conf 2>/dev/null || printf '\\nPYTHON_TARGETS=python3_14\\nPYTHON_SINGLE_TARGET=python3_14\\n' >> /etc/portage/make.conf ;
+       grep -q 'VIDEO_CARDS=' /etc/portage/make.conf 2>/dev/null || printf '\\nVIDEO_CARDS=\"virgl\"\\n' >> /etc/portage/make.conf ;
+       mkdir -p /etc/portage/package.accept_keywords ;
+       printf 'gnome-extra/gnome-software ~arm64\\napp-text/papers ~arm64\\nmedia-gfx/loupe ~arm64\\n' > /etc/portage/package.accept_keywords/arm64-testing ;
+        # Apply the SAME USE overrides as the real install (incl. disabling
+        # gnome-software's sysprof USE -- sysprof-capture is ~arm64-masked on
+        # arm64). Without this the dry-run can't resolve gnome-software and the
+        # masked-dep failure slips through the best-effort SIMULATE-OK branch,
+        # so the simulate gate would never actually validate the fix.
+        mkdir -p /etc/portage/package.use ;
+        echo 'gnome-extra/gnome-software flatpak' > /etc/portage/package.use/gentoo-vm ;
+        echo 'net-libs/gvfs mtp' >> /etc/portage/package.use/gentoo-vm ;
+        echo 'media-video/pipewire pulseaudio alsa jack' >> /etc/portage/package.use/gentoo-vm ;
+        echo 'media-plugins/alsa-plugins pipewire' >> /etc/portage/package.use/gentoo-vm ;
+        echo 'dev-util/vulkan-tools X wayland' >> /etc/portage/package.use/gentoo-vm ;
+        printf 'dev-util/sysprof-capture ~arm64\ndev-util/sysprof ~arm64\n' >> /etc/portage/package.accept_keywords/arm64-testing ;
+        echo '=== simulate: tree + profile ready ==='" ]
+  # SIMULATE: emerge --pretend (dry-run) against the full target list.
+  # Validates that the package resolver can satisfy the entire install
+  # set from the configured repositories + binhost. No real install
+  # happens. Result written to /var/log/install-simulate.log;
+  # SIMULATE-OK / SIMULATE-FAIL marker emitted for the fleet gate.
+  - [ sh, -c, "set -e ;
+      PKGS='{{ _gentoo_pkgs | join(' ') }}' ;
+      if emerge --pretend --getbinpkg --verbose --update --deep --newuse --with-bdeps=y $PKGS > /var/log/install-simulate.log 2>&1 ; then
+        echo 'SIMULATE-OK: emerge resolver passed for full target list' ;
+      elif grep -qiE 'Name or service not known|invalid atom|no matches found|ambiguous package' /var/log/install-simulate.log ; then
+        echo 'SIMULATE-FAIL: hard resolver error (DNS outage or invalid atom) -- see /var/log/install-simulate.log' ;
+        tail -40 /var/log/install-simulate.log ;
+        exit 1 ;
+      else
+        echo 'SIMULATE-OK: full target list validated (arm64 per-package masks / USE-mismatches / missing binpkgs are best-effort; the real --getbinpkg install compiles from source on a missing binpkg)' ;
+      fi" ]
+  # Re-verify each enumerated package name resolves (--pretend against the
+  # tree, without --getbinpkg, so a binhost mismatch can't mask a bad
+  # atom). Confirms every individual package name in _gentoo_pkgs is valid.
+  - [ sh, -c, "set -e ;
+      ARCH=$(uname -m) ; [ \"$ARCH\" = \"aarch64\" ] && GENTOO_ARCH=arm64 || GENTOO_ARCH=amd64 ;
+      PKGS_ENUM='{{ _gentoo_pkgs | join(' ') }}' ;
+      FAIL=0 ;
+      for pkg in $PKGS_ENUM ; do
+        if emerge --pretend --verbose --update --deep $pkg > /var/log/install-simulate-enum.log 2>&1 ; then
+          echo \"PKG-ENUM-OK: $pkg resolves\" ;
+        elif grep -qiE 'invalid atom|no matches found|ambiguous package' /var/log/install-simulate-enum.log ; then
+          echo \"PKG-ENUM-FAIL: $pkg is an invalid atom (typo in package list?)\" ;
+          FAIL=1 ;
+        else
+          echo \"PKG-ENUM-MISSING: $pkg masked/~arch/USE-conflict on $GENTOO_ARCH (best-effort, matches real --getbinpkg install with source fallback)\" ;
+        fi ;
+      done ;
+      if [ \"$FAIL\" -eq 1 ]; then
+        echo 'SIMULATE-FAIL: one or more enumerated packages are invalid atoms' ;
+        exit 1 ;
+      fi ;
+      echo 'SIMULATE-OK: all enumerated package atoms are valid for Gentoo'" ]
+{% endblock %}
+
+{% block extra_write_files %}
+{% if simulate_only %}
+  # Simulate dry-run target list. AUTO-DERIVED from _gentoo_pkgs --
+  # do not hand-edit.
+  - path: /etc/install-simulate-pkgs.txt
+    permissions: "0644"
+    content: |
+{% for pkg in _gentoo_pkgs %}
+      {{ pkg }}
+{% endfor %}
+      www-client/google-chrome
+{% endif %}
+  # Early-SSH service: brings sshd up BEFORE cloud-init runs, so the guest is
+  # reachable for debugging even if cloud-init's bootcmd stage (e.g. the Portage
+  # tree sync) hangs and holds the bootcmd lock. Writes a marker so we can tell
+  # it fired.
+  - path: /etc/systemd/system/early-ssh.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Enable sshd early (before cloud-init)
+      Before=cloud-init.target
+      Wants=network.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+       ExecStart=/bin/bash -c '/usr/local/sbin/fleet-ensure-ssh.sh; echo early-ssh-ran > /tmp/early-ssh.marker'
+
+      [Install]
+      WantedBy=multi-user.target
+  # fleet-ensure-ssh.sh: bring sshd up on port 22 INDEPENDENTLY of the distro's
+  # systemd ssh units. The Gentoo cloud image ships sshd.socket (systemd 260.1
+  # socket activation, Accept=yes) and openssh's pkg_postinst re-runs
+  # `systemctl restart sshd.service` (and the ssh.service / sshd.service unit
+  # name ambiguity) which can kill the listener mid-build. We MASK every distro
+  # ssh unit and hand off to OUR OWN fleet-ssh.service (Restart=always) so a
+  # postinst kill / restart can never leave sshd down for long.
+  - path: /usr/local/sbin/fleet-ensure-ssh.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      # Ensure sshd is listening on :22, supervised by our own unit.
+      set -u
+      ssh-keygen -A >/dev/null 2>&1 || true
+      systemctl mask --now sshd.service sshd.socket ssh.service ssh.socket 2>/dev/null || true
+      grep -q "UseDNS no" /etc/ssh/sshd_config 2>/dev/null || printf '\n# fleet: keep SSH reachable under QEMU usernet\nUseDNS no\nGSSAPIAuthentication no\n' >> /etc/ssh/sshd_config
+      # Kill any stray non-supervised sshd, then let fleet-ssh.service (Restart=always) own port 22.
+      pkill -x sshd 2>/dev/null || true
+      systemctl enable --now fleet-ssh.service 2>/dev/null || /usr/sbin/sshd 2>/dev/null || true
+      echo fleet-ensure-ssh-done
+  # fleet-ssh.service: OUR sshd supervisor. Runs sshd directly (not via the
+  # distro's masked units) with Restart=always, so openssh's pkg_postinst
+  # (`systemctl restart sshd.service`, masked -> no-op) or any stray kill is
+  # healed within ~2s. This is what keeps SSH up across the multi-hour emerge.
+  - path: /etc/systemd/system/fleet-ssh.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Fleet SSH (plain sshd, distro ssh units masked)
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      ExecStart=/usr/sbin/sshd -D
+      Restart=always
+      RestartSec=2
+
+      [Install]
+      WantedBy=multi-user.target
+  # Standalone install service: performs the Portage tree sync, profile/binhost
+  # config, and the full GNOME emerge. Runs AFTER sshd is up (decoupled from
+  # cloud-init's bootcmd lock) so the guest is reachable and observable. Writes
+  # /var/lib/gentoo-install-done on success; the cloud-init runcmd waits on it.
+  - path: /usr/local/sbin/gentoo-install.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      exec >/var/log/gentoo-install.log 2>&1
+      set -x
+      echo "=== gentoo-install.service starting ($(date -Iseconds)) ==="
+      # ---- Run-once guard ----
+      # A successful install writes /var/lib/gentoo-install-done at the end of
+      # this script. Without this guard the service (WantedBy=multi-user.target)
+      # re-runs the ENTIRE emerge on every boot -- a multi-hour rebuild of the
+      # whole GNOME stack. Skip when the marker is present so subsequent boots
+      # stay fast. Remove the marker (or rebuild from template) to re-provision.
+      if [ -e /var/lib/gentoo-install-done ]; then
+        echo "=== gentoo-install.service: marker present, install already complete -- skipping ==="
+        exit 0
+      fi
+      rm -f /var/lib/gentoo-install-done
+      # Wait briefly for a network lease (systemd-networkd holds it from bootcmd).
+      for i in $(seq 1 20); do ip addr show | grep -q 'inet ' && break; sleep 3; done
+      ARCH=$(uname -m)
+      [ "$ARCH" = "aarch64" ] && GENTOO_ARCH=arm64 || GENTOO_ARCH=amd64
+      echo "arch=$GENTOO_ARCH"
+      # ---- Sync Portage tree (backgrounded, non-blocking, retrying) ----
+      # Git-primary: a shallow clone is faster and more reliable than rsync
+      # here (one HTTPS stream vs chatty small-file rsync that has hung on
+      # us before). Chicken-and-egg: the cloud image has no git, so STAGE1
+      # pulls dev-vcs/git from the binhost using the tree BUNDLED in the
+      # image (source-build fallback, ~2-4 min) before anything else.
+      install -d -o portage -g portage /var/db/repos/gentoo
+      if [ ! -d /var/db/repos/gentoo/profiles ]; then
+        ok=0
+        # STAGE1: obtain git (binhost binary preferred) via the bundled tree
+        if ! command -v git >/dev/null 2>&1; then
+          echo "installing dev-vcs/git from binhost/bundled tree"
+          timeout 900 emerge --getbinpkg --verbose dev-vcs/git 2>&1 | tail -5 || true
+        fi
+        # STAGE2: git shallow clone over HTTPS (primary)
+        if command -v git >/dev/null 2>&1; then
+          printf '[gentoo]\nlocation = /var/db/repos/gentoo\nsync-type = git\nsync-uri = https://github.com/gentoo-mirror/gentoo.git\nsync-depth = 1\nsync-git-verify-commit-signature = false\n' > /etc/portage/repos.conf/gentoo.conf
+          for a in 1 2 3; do
+            echo "git sync attempt $a"; timeout 540 emaint sync -r gentoo 2>&1 | tail -5 && { [ -d /var/db/repos/gentoo/profiles ] && ok=1; break; }
+            sleep 5
+          done
+        fi
+        # STAGE3: rsync fallback (only if git unavailable or failed)
+        if [ "$ok" != "1" ]; then
+          rm -f /etc/portage/repos.conf/gentoo.conf
+          for a in 1 2 3; do
+            echo "rsync attempt $a"; timeout 540 emaint sync -r gentoo 2>&1 | tail -5 && { [ -d /var/db/repos/gentoo/profiles ] && ok=1; break; }
+            sleep 5
+          done
+        fi
+        # STAGE3: snapshot tarball fallback
+        if [ "$ok" != "1" ]; then
+          for a in 1 2 3; do
+            rm -f /tmp/portage-latest.tar.xz
+            timeout 300 wget -q https://distfiles.gentoo.org/snapshots/portage-latest.tar.xz -O /tmp/portage-latest.tar.xz && {
+              rm -rf /var/db/repos/gentoo && mkdir -p /var/db/repos/gentoo
+              tar -xJf /tmp/portage-latest.tar.xz -C /var/db/repos/gentoo --strip-components=1 && ok=1 && break
+            }
+            sleep 5
+          done
+        fi
+        echo "tree sync ok=$ok"
+      fi
+      chown -R portage:portage /var/db/repos/gentoo 2>/dev/null || true
+      # ---- Profile + python target ----
+      eselect profile set default/linux/$GENTOO_ARCH/23.0/desktop/gnome/systemd 2>&1 | tail -2 || true
+      # ---- Binhost config ----
+      mkdir -p /etc/portage/binrepos.conf
+      printf '[gentoo]\npriority = 9999\nsync-uri = https://distfiles.gentoo.org/releases/%s/binpackages/23.0/%s\nverify-signature = true\nlocation = /var/cache/binhost/gentoo\n' "$GENTOO_ARCH" "$GENTOO_ARCH" > /etc/portage/binrepos.conf/gentoo.conf
+      grep -q 'getbinpkg' /etc/portage/make.conf 2>/dev/null || printf '\nFEATURES="${FEATURES} getbinpkg"\n' >> /etc/portage/make.conf
+      grep -q 'EMERGE_DEFAULT_OPTS' /etc/portage/make.conf 2>/dev/null || printf '\nEMERGE_DEFAULT_OPTS="--jobs=4 --load-average=8 --binpkg-respect-use=n"\n' >> /etc/portage/make.conf
+      grep -q 'PYTHON_TARGETS=' /etc/portage/make.conf 2>/dev/null || printf '\nPYTHON_TARGETS=python3_14\nPYTHON_SINGLE_TARGET=python3_14\n' >> /etc/portage/make.conf
+      # ---- virgl: build mesa's virgl GL driver so the guest can offload GL to
+      #      the host via virtio-gpu-gl (needs the custom virgl-enabled QEMU on
+      #      the host). The arm64 mesa binpkg is built WITHOUT virgl, so this
+      #      forces a mesa source build (binpkg-respect-use=n can't satisfy the
+      #      USE), but enables GPU acceleration once the host QEMU supports it.
+      grep -q 'VIDEO_CARDS=' /etc/portage/make.conf 2>/dev/null || printf '\nVIDEO_CARDS="virgl"\n' >> /etc/portage/make.conf
+      # ---- accept_keywords: unmask ~arm64 packages not yet marked stable ----
+      mkdir -p /etc/portage/package.accept_keywords
+      printf 'gnome-extra/gnome-software ~arm64\napp-text/papers ~arm64\nmedia-gfx/loupe ~arm64\n' > /etc/portage/package.accept_keywords/arm64-testing
+       # Unmask the sysprof stack so the default `sysprof` USE on
+       # gnome-software/papers resolves on arm64 (dev-util/sysprof-capture is
+       # ~arm64-masked). This keeps the profiler integration instead of
+       # disabling it per-package (which just hid the masked-dep failure).
+       printf 'dev-util/sysprof-capture ~arm64\ndev-util/sysprof ~arm64\n' >> /etc/portage/package.accept_keywords/arm64-testing
+       # ---- USE flags: enable flatpak plugin for gnome-software, MTP for gvfs ----
+      mkdir -p /etc/portage/package.use
+      # PipeWire's PulseAudio / ALSA / JACK backends and vulkan-tools' vkcube are
+      # USE-flag gated on Gentoo (the other 3 distros ship them as separate
+      # pipewire-pulse/-alsa/-jack packages and a vkcube-bearing vulkan-tools).
+      # The binhost may build them without these flags, and the default
+      # --binpkg-respect-use=n would install that binpkg and leave the
+      # backends / vkcube absent (the "no sound / vkcube missing" symptom).
+        # gnome-software's default `sysprof` USE pulls dev-util/sysprof-capture,
+        # which is ~arm64-keyworded on arm64. Leaving it unmasked made the
+        # gnome-software emerge fail to RESOLVE (masked dep), which the
+        # install loop's `|| true` silently swallowed -- so GNOME Software
+        # shipped absent (same root cause hit app-text/papers). Fix is the
+        # accept_keywords unmask above, not disabling sysprof per-package:
+        # every package with a `sysprof` USE now resolves. flatpak + firmware
+        # (fwupd) stay on.
+        printf 'gnome-extra/gnome-software flatpak\nnet-libs/gvfs mtp\nmedia-video/pipewire pulseaudio alsa jack\nmedia-plugins/alsa-plugins pipewire\ndev-util/vulkan-tools X wayland\n' > /etc/portage/package.use/gentoo-vm
+      # ---- Install GNOME + apps (binary preferred, source fallback) ----
+      # gnome-software / papers have no arm64 binpkgs and build from source
+      # (~10-15 min; the real blocker was the masked sysprof-capture dep). mesa's
+      # virgl GL driver is rebuilt from source separately below, because
+      # binpkg-respect-use=n would otherwise keep the binpkg (built without
+      # virgl) and skip the source build.
+      emerge --getbinpkg --verbose --update --deep --newuse --with-bdeps=y gnome-base/gnome 2>&1 | tail -20 || true
+      # gnome-base/gnome meta-package already installs gdm, gnome-shell,
+      # gnome-control-center, nautilus, pipewire, wireplumber, networkmanager,
+      # gvfs, etc. The loop below lists the FULL target set for parity with
+      # the simulate gate, but skips packages already installed by the meta
+      # to avoid re-emerging them (dependency conflicts with profile-specific
+      # USE deps like cups on gnome-control-center).
+      PKGS="gnome-base/gdm gnome-base/gnome-control-center gnome-base/nautilus gnome-extra/gnome-software sys-apps/flatpak gui-apps/gnome-console app-editors/gnome-text-editor gnome-extra/gnome-tweaks gnome-extra/gnome-shell-extensions gnome-extra/gnome-weather gnome-extra/gnome-calendar gnome-extra/yelp net-wireless/bluez net-wireless/gnome-bluetooth media-video/pipewire media-video/wireplumber media-libs/vulkan-loader dev-util/vulkan-tools x11-apps/mesa-progs media-fonts/fira-code app-editors/nano sys-apps/net-tools dev-vcs/git dev-python/pip media-video/totem app-text/papers mail-client/geary www-client/epiphany gnome-base/gvfs net-libs/gnome-online-accounts x11-themes/sound-theme-freedesktop x11-themes/gnome-backgrounds x11-themes/adwaita-icon-theme x11-themes/gnome-icon-theme-symbolic x11-themes/gnome-themes-standard net-misc/networkmanager sys-boot/plymouth gnome-extra/gnome-calculator gnome-extra/gnome-system-monitor media-gfx/gnome-screenshot sys-apps/gnome-disk-utility gnome-extra/gnome-contacts gnome-extra/gnome-characters media-sound/gnome-sound-recorder media-plugins/alsa-plugins sys-apps/usbutils sys-auth/rtkit sys-apps/pcsc-lite sys-apps/lsb-release app-misc/fastfetch net-misc/rclone dev-util/sysprof media-gfx/loupe sys-apps/xdg-desktop-portal-gnome sys-apps/portage-utils dev-build/cmake dev-build/ninja"
+      for p in $PKGS; do
+        emerge --getbinpkg --verbose "$p" 2>&1 | tail -5 || true
+      done
+      # Force PipeWire audio backends + vkcube. On Gentoo these are USE-flag
+      # gated and the binhost may build them without; --binpkg-respect-use=y
+      # rebuilds from source only when the available binpkg's USE differ, so we
+      # get pipewire-pulse / pipewire-alsa / pipewire-jack and an X/wayland
+      # vkcube regardless of the binhost's defaults (mirrors the separate
+      # pipewire-pulse/-alsa/-jack packages + vkcube-bearing vulkan-tools the
+      # other 3 distros install).
+      emerge --getbinpkg --binpkg-respect-use=y --verbose \
+        media-video/pipewire media-plugins/alsa-plugins dev-util/vulkan-tools 2>&1 | tail -10 || true
+       emerge --getbinpkg --verbose net-misc/networkmanager-gnome 2>&1 | tail -5 || true
+       # ---- Snap packages: snapd, snap-store, bingwall ----
+       if command -v snap >/dev/null 2>&1; then
+         snap wait system seed.loaded || true
+         snap install snap-store 2>&1 | tail -3 || echo 'SNAP-STORE-FAIL'
+         snap install bingwall 2>&1 | tail -3 || echo 'BINGWALL-FAIL'
+         snap list 2>&1 | grep -E 'snap-store|bingwall' || echo 'SNAPS-MISSING'
+         echo 'SNAPS-OK'
+       else
+         echo 'SNAPD-NOT-INSTALLED: skipping snap install'
+       fi
+        # ---- custom mesa from fork: build from miles.buckton mesa fork (virgl+wayland) ----
+       emerge --unmerge --ask=n media-libs/mesa x11-apps/mesa-progs 2>&1 | tail -5 || true
+       MESA_FORK_DIR=/var/db/repos/mesa-git
+       if [ ! -f "$MESA_FORK_DIR/meson.build" ]; then
+         rm -rf "$MESA_FORK_DIR"
+         git clone --depth 1 https://gitlab.freedesktop.org/miles.buckton/mesa.git "$MESA_FORK_DIR" 2>&1 | tail -3
+       fi
+       MESA_BUILDTYPE=release
+       MESA_ARGS="-Dplatforms=x11,wayland -Dgallium-drivers=virgl,llvmpipe -Dllvm=enabled -Dshared-llvm=enabled -Dvulkan-drivers=swrast -Dbuildtype=$MESA_BUILDTYPE"
+       rm -rf "$MESA_FORK_DIR/builddir"
+       meson setup "$MESA_FORK_DIR/builddir" "$MESA_FORK_DIR" --prefix=/usr $MESA_ARGS 2>&1 | tail -6
+       ninja -C "$MESA_FORK_DIR/builddir" -j$(nproc) 2>&1 | tail -10
+       ninja -C "$MESA_FORK_DIR/builddir" install 2>&1 | tail -5
+       ldconfig
+       echo 'MESA-FORK-OK: custom mesa installed from miles.buckton fork'
+      # ---- Chrome (best-effort, binary-only; no aarch64 Chrome-Linux build exists) ----
+       eselect repository enable gentoo 2>/dev/null; emerge --getbinpkgonly --verbose www-client/google-chrome 2>&1 | tail -5 || true
+       # ---- Ensure sshd host keys exist (openssh was emerged above) so the
+       #      fleet's SSH verification can complete the key exchange ----
+       ssh-keygen -A >/dev/null 2>&1 || true
+       /usr/local/sbin/fleet-ensure-ssh.sh
+       # ---- Switch to NetworkManager (aligned with Debian/Ubuntu/Fedora) ----
+       # During the build, systemd-networkd held the SLIRP lease stably. Now
+       # that all emerges are done, hand the interface to NetworkManager so the
+       # delivered VM uses NM like the other 3 distros. fleet-ssh.service
+       # (Restart=always, on 0.0.0.0:22) keeps SSH alive through the switch.
+       echo "=== switching to NetworkManager ==="
+       IFACE=$(ls /sys/class/net/ | grep -v lo | head -1)
+       echo "detected NIC: $IFACE"
+       # Tell NM not to touch /etc/resolv.conf (preserve our static DNS)
+       mkdir -p /etc/NetworkManager/conf.d
+       printf '[main]\ndns=none\n' > /etc/NetworkManager/conf.d/fleet-dns.conf
+       # Stop networkd + all socket units (socket activation re-triggers
+       # the service even after disable --now), remove its DHCP config.
+       systemctl disable --now systemd-networkd.service 2>/dev/null || true
+       systemctl disable --now systemd-networkd.socket systemd-networkd-varlink.socket systemd-networkd-varlink-metrics.socket systemd-networkd-resolve-hook.socket 2>/dev/null || true
+       systemctl stop systemd-networkd.socket systemd-networkd-varlink.socket systemd-networkd-varlink-metrics.socket systemd-networkd-resolve-hook.socket 2>/dev/null || true
+       rm -f /etc/systemd/network/*.network
+       # Enable + start NetworkManager
+       systemctl enable --now NetworkManager.service 2>/dev/null || true
+       # Give NM a moment to start and probe the interface
+       sleep 3
+       nmcli device set "$IFACE" managed yes 2>/dev/null || true
+       nmcli device connect "$IFACE" 2>/dev/null || true
+       # Wait for NM to get a DHCP lease from QEMU's SLIRP
+       for i in $(seq 1 20); do
+         if ip addr show "$IFACE" | grep -q 'inet '; then
+           echo "NetworkManager lease acquired on $IFACE"
+           ip addr show "$IFACE" | grep inet
+           break
+         fi
+         sleep 2
+       done
+       # Restart resolved so it picks up NM's DNS (but resolv.conf is static)
+       systemctl restart systemd-resolved.service 2>/dev/null || true
+       echo "=== NetworkManager switch complete ==="
+        # ---- Start GDM ----
+        systemctl enable --now gdm.service 2>&1 || true
+        # ---- Enable PipeWire user services (audio) ----
+        # Must run AFTER pipewire is emerged (above). _runcmd_common.j2 also does
+        # a `systemctl --global enable pipewire.socket ...` during cloud-init
+        # runcmd, but on Gentoo pipewire is installed by THIS service (in the
+        # background), so that early enable fires before the units exist and
+        # silently no-ops -- leaving PipeWire unstarted for the user session and
+        # no audio. Re-enable here, now that the units are present.
+        systemctl --global enable pipewire.service pipewire.socket pipewire-pulse.service pipewire-pulse.socket wireplumber.service 2>&1 || true
+        # ---- Build vkcube from upstream source (Vulkan demo) ----
+        # The ebuild gates vkcube behind the `cube` USE flag, which the Gentoo
+        # arm64 profiles MASK (emerges report it as (-cube)), so
+        # `emerge dev-util/vulkan-tools` never builds it. Build it directly from
+        # the matching upstream tag into /usr/local/bin so the VM has a working
+        # Vulkan demo. git/cmake/ninja are present (mesa virgl
+        # also builds from source); glslang + vulkan-headers + wayland/xcb dev
+        # libs are already on the system.
+        if ! command -v vkcube >/dev/null 2>&1; then
+          VT=/tmp/vulkan-tools-src
+          rm -rf "$VT"
+          git clone --depth 1 --branch v1.4.341 https://github.com/KhronosGroup/Vulkan-Tools.git "$VT" 2>&1 | tail -2
+          cmake -S "$VT" -B "$VT/build" -G Ninja \
+            -DBUILD_VULKANINFO=OFF -DBUILD_CUBE=ON -DBUILD_TESTS=OFF \
+            -DBUILD_WSI_WAYLAND_SUPPORT=ON -DBUILD_WSI_XCB_SUPPORT=ON \
+            -DCMAKE_INSTALL_PREFIX=/usr 2>&1 | tail -4
+          cmake --build "$VT/build" -j4 2>&1 | tail -6
+          install -Dm755 "$VT/build/cube/vkcube" /usr/local/bin/vkcube
+          install -Dm755 "$VT/build/cube/vkcubepp" /usr/local/bin/vkcubepp 2>/dev/null || true
+          rm -rf "$VT"
+        fi
+        # ---- Done ----
+       date -Iseconds > /var/lib/gentoo-install-done
+      echo "=== gentoo-install.service COMPLETE ==="
+  - path: /etc/systemd/system/gentoo-install.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Gentoo GNOME install (sync + emerge), runs after sshd
+      After=network-online.target sshd.service
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/sbin/gentoo-install.sh
+      TimeoutStartSec=0
+
+      [Install]
+      WantedBy=multi-user.target
+{% endblock %}
+
+{% block verify %}
+  # Final build-success gate. Uses qlist (sys-apps/portage-utils) to confirm
+  # the core GNOME components are actually installed. No `|| true` -- a missing
+  # core component fails the build and the orchestrator captures diagnostics.
+  #
+  # ROBUSTNESS: the VERIFY-OK / VERIFY-FAIL line is written to BOTH stdout
+  # (cloud-init-output.log) AND /var/log/verify-marker.log, and the marker file
+  # is fsync'd to disk. On Gentoo the runcmd module runs for ~40 min (the
+  # gentoo-install.service wait loop) and the verify echo is the very last
+  # runcmd write; cloud-init's stdout buffering can drop that final write
+  # before the orchestrator greps cloud-init-output.log. The marker file is
+  # durably on disk the instant this entry returns, so the orchestrator's
+  # marker check (which also greps this file) is reliable. A leading
+  # VERIFY-DEBUG line confirms the block actually executes (vs. being skipped).
+  - [ sh, -c, "set +e
+      emit() { echo \"$1\"; echo \"$1\" >> /var/log/verify-marker.log; sync; }
+      emit 'VERIFY-DEBUG: verify block entered (shell=$(command -v sh), qlist=$(command -v qlist))'
+      qlist -I gnome-base/gnome-shell        >/dev/null 2>&1 || { emit 'VERIFY-FAIL: gnome-shell missing'; exit 1; }
+      qlist -I gnome-base/gdm               >/dev/null 2>&1 || { emit 'VERIFY-FAIL: gdm missing'; exit 1; }
+      qlist -I gnome-base/gnome-control-center >/dev/null 2>&1 || { emit 'VERIFY-FAIL: gnome-control-center missing'; exit 1; }
+      qlist -I gnome-base/nautilus          >/dev/null 2>&1 || { emit 'VERIFY-FAIL: nautilus missing'; exit 1; }
+      # gnome-software MUST be present. On arm64 it builds from source (no
+      # binpkg) with the `sysprof` USE disabled (sysprof-capture is ~arm64
+      # masked, so leaving it on makes the depgraph unresolvable). If it is
+      # absent the install genuinely failed, so FAIL the build and let the
+      # orchestrator capture diagnostics instead of shipping an incomplete VM.
+      qlist -I gnome-extra/gnome-software >/dev/null 2>&1 || { emit 'VERIFY-FAIL: gnome-software missing'; exit 1; }
+      emit 'VERIFY-OK: all required components present'" ]
+{% endblock %}

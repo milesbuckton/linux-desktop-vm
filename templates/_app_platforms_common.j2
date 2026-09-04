@@ -1,0 +1,68 @@
+{# ---------------------------------------------------------------------- #}
+{# App-platform setup shared by all distros: Google Chrome, Flathub  #}
+{# apps (Flatseal + Gear Lever + Picture of the Day). Include at the END  #}
+{# template's post_runcmd block (the framework packages -- `flatpak` --  #}
+{# install via each family's native package list so they are  #}
+{# simulate-validated; this include only adds the apps on top).  #}
+{#  #}
+{# Every install here is STRICTLY BEST-EFFORT with an explicit marker so  #}
+{# the fleet can see the outcome without any of them failing the build  #}
+{# (vendor-repo/Flathub blips must never sink a VM -- cf.  #}
+{# Markers: CHROME-OK/CHROME-MISSING,  #}
+{# FLATPAK-APPS-OK/FLATPAK-APPS-MISSING.  #}
+{#  #}
+{# Requires per-family variable (set in ubuntu.j2):  #}
+{#  _chrome_install_cmd -- installs google-chrome-stable via apt  #}
+{#  package manager. The Google vendor repo itself #}
+{#  is registered in each family's bootcmd  #}
+{#  (all arches -- Google ships arm64/aarch64  #}
+{#  Linux builds; the repo arch token is selected  #}
+{#  by GUEST_ARCH in each family's bootcmd).  #}
+{#  google-chrome-stable is ALSO in every family's #}
+{#  simulate dry-run list (bootcmd runs in simulate#}
+{#  too, so the dry-run resolves it) -- a Google  #}
+{#  repo/arch regression surfaces at the simulate  #}
+{#  gate, not as a CHROME-MISSING surprise.  #}
+{# ---------------------------------------------------------------------- #}
+
+{# ----- Google Chrome (both arches; vendor repo registered in bootcmd) -- #}
+{# 3-attempt retry/backoff : a transient vendor-repo blip  #}
+{# must not silently drop Chrome, mirroring the Flathub loop below.  #}
+  - [ sh, -c, "ok=0; for attempt in 1 2 3; do
+  if {{ _chrome_install_cmd }} > /tmp/chrome-install.log 2>&1 ; then
+  ok=1; echo \"CHROME-OK: google-chrome-stable installed (attempt $attempt)\" ; break ;
+  fi ;
+  echo \"chrome install attempt $attempt failed; retrying\" ;
+  sleep 30 ;
+  done ;
+  [ $ok -eq 1 ] || { echo 'CHROME-MISSING: google-chrome-stable not installed after 3 attempts (vendor repo unreachable?)' ; tail -15 /tmp/chrome-install.log 2>/dev/null || true ; }" ]
+
+{# ----- Flathub apps: Flatseal (GUI for Flatpak permissions) + Gear Lever #}
+{# (AppImage manager) + Picture of the Day (daily wallpaper from Wikipedia #}
+{# POTD / NASA APOD / etc.; multi-arch -- aarch64 builds published). First  #}
+{# install pulls the ~1 GB  #}
+{# org.gnome.Platform runtime, so retry with backoff. Best-effort -- a  #}
+{# Flathub blip never fails the build.  #}
+  - [ sh, -c, "flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo 2>&1 | tail -3 || true ;
+  for attempt in 1 2 3; do
+  if flatpak install -y flathub com.github.tchx84.Flatseal it.mijorus.gearlever de.swsnr.pictureoftheday > /tmp/flatpak-apps.log 2>&1 ; then
+  echo 'FLATPAK-APPS-OK: Flatseal + Gear Lever + Picture of the Day installed from Flathub (attempt $attempt)' ;
+  break ;
+  fi ;
+  echo \"flatpak apps install attempt $attempt failed; retrying\" ;
+  sleep $((attempt * 30)) ;
+  done ;
+  flatpak list --app --columns=application 2>/dev/null | grep -qE 'com.github.tchx84.Flatseal|it.mijorus.gearlever|de.swsnr.pictureoftheday' || echo 'FLATPAK-APPS-MISSING: Flathub apps not installed after 3 attempts (Flathub unreachable or runtime download failed)'" ]
+
+{# ----- App-store-style installs are covered by Flathub (Flatseal, Gear
+  Lever) installed best-effort above; no universal app-store packaging
+  beyond Flatpak is used by any distro. #}
+
+{# ----- PowerShell (universal GitHub tarball; distro-agnostic, unlike the
+  Microsoft apt/dnf repos which lag the newest releases -- Ubuntu 26.04 /
+  Debian 13 / Fedora 44 may lack a published repo).
+  Best-effort with marker POWERSHELL-OK / POWERSHELL-MISSING so a GitHub
+  download blip never sinks the build . Not package-manager
+  tracked (no auto-update); installed to /opt/microsoft/powershell/7 with a
+  /usr/local/bin/pwsh symlink. #}
+  - [ sh, -c, "tmp=$(mktemp -d); arch={{ 'arm64' if GUEST_ARCH == 'aarch64' else 'x64' }}; ver=$(curl -fsSL https://api.github.com/repos/PowerShell/PowerShell/releases/latest | grep -oE 'tag_name.: .v[0-9.]+' | grep -oE '[0-9.]+' | head -1); if [ -z \"$ver\" ]; then echo 'POWERSHELL-MISSING: cannot resolve latest PowerShell version'; rm -rf \"$tmp\"; elif curl -fsSL -o \"$tmp/pwsh.tgz\" \"https://github.com/PowerShell/PowerShell/releases/download/v$ver/powershell-$ver-linux-$arch.tar.gz\"; then mkdir -p /opt/microsoft/powershell/7; tar -xzf \"$tmp/pwsh.tgz\" -C /opt/microsoft/powershell/7; chmod +x /opt/microsoft/powershell/7/pwsh; ln -sf /opt/microsoft/powershell/7/pwsh /usr/local/bin/pwsh; if /usr/local/bin/pwsh --version >/dev/null 2>&1; then echo \"POWERSHELL-OK: $(/usr/local/bin/pwsh --version) at /usr/local/bin/pwsh\"; else echo 'POWERSHELL-MISSING: pwsh installed but failed to start (missing runtime libs?)'; fi; rm -rf \"$tmp\"; else rm -rf \"$tmp\"; echo 'POWERSHELL-MISSING: download failed'; fi" ]

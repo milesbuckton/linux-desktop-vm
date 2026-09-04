@@ -1,0 +1,59 @@
+{# ---------------------------------------------------------------------- #}
+{# GNOME Shell extensions: install from tagged GitHub releases as ZIPs.  #}
+{# Included by ALL families. Self-balancing: any extension already  #}
+{# present on disk (i.e. installed from a distro package) is SKIPPED, so  #}
+{# each distro natively packages what it can and zips fill exactly the  #}
+{# gaps: ubuntu 6 zip; gentoo 6 zip (no native d2p on arm64). #}
+{# gentoo 6 zip (its d2p ebuild lacks arm64); ubuntu 6 zip.  #}
+{#  #}
+{# Enablement happens separately via _dconf_common.j2 (system-wide  #}
+{# org.gnome.shell enabled-extensions default); missing uuids are  #}
+{# ignored harmlessly by gnome-shell.  #}
+{#  #}
+{# STRICTLY BEST-EFFORT per  #}
+{# Markers: GS-EXT-OK <uuid> / GS-EXT-SKIPPED <uuid> / GS-EXT-DONE.  #}
+{# ---------------------------------------------------------------------- #}
+  - [ sh, -c, "SVER=$(gnome-shell --version 2>/dev/null | awk '{print int($3)}'); [ -z \"$SVER\" ] && SVER=0; STAGE=$(mktemp -d);
+  BASE_URL=\"{{ GNOME_EXT_BASE_URL | default('') }}\";
+  install_ext() {
+  repo=$1; uuid=$2; artifact=${3:-$uuid.zip};
+  [ -d \"/usr/share/gnome-shell/extensions/$uuid\" ] && { echo \"GS-EXT-SKIP: $uuid (already installed from distro package)\"; return 0; }
+  if [ -n \"$BASE_URL\" ]; then
+  url=\"$BASE_URL/$artifact\";
+  else
+  for attempt in 1 2; do
+  rel=$(curl -fsSL --max-time 60 \"https://api.github.com/repos/$repo/releases/latest\" 2>/dev/null) || { sleep 10; continue; }
+  url=$(printf '%s' \"$rel\" | grep -oE '\"browser_download_url\": *\"[^\"]+\\.zip\"' | head -1 | cut -d'\"' -f4)
+  [ -n \"$url\" ] && break;
+  sleep 10;
+  done
+  fi
+  [ -z \"$url\" ] && { echo \"GS-EXT-SKIPPED: $uuid (no reachable source)\"; return 0; }
+  for attempt in 1 2 3 4; do
+  rm -rf \"$STAGE/$uuid\"; mkdir -p \"$STAGE/$uuid\"
+  curl -fsSL --max-time 120 -o \"$STAGE/ext.zip\" \"$url\" || { sleep 8; continue; }
+  unzip -qo \"$STAGE/ext.zip\" -d \"$STAGE/$uuid\" 2>/dev/null || { sleep 5; continue; }
+  [ -f \"$STAGE/$uuid/metadata.json\" ] || { echo \"GS-EXT-SKIPPED: $uuid (downloaded zip lacks metadata.json)\"; return 0; }
+  if grep -qE '\"shell-version\"[^]]*\\b$SVER\\.?\\d*\\b' \"$STAGE/$uuid/metadata.json\"; then
+  mkdir -p /usr/share/gnome-shell/extensions
+  rm -rf \"/usr/share/gnome-shell/extensions/$uuid\"
+  mv \"$STAGE/$uuid\" \"/usr/share/gnome-shell/extensions/$uuid\"
+  echo \"GS-EXT-OK: $uuid installed (shell $SVER)\"
+  return 0
+  else
+  echo \"GS-EXT-SKIPPED: $uuid (latest release does not declare GNOME $SVER support)\"
+  return 0
+  fi
+  done
+  echo \"GS-EXT-SKIPPED: $uuid (download failed after retries)\"
+  }
+  install_ext Schneegans/Burn-My-Windows burn-my-windows@schneegans.github.com
+  install_ext Schneegans/Desktop-Cube desktop-cube@schneegans.github.com
+  install_ext micheleg/dash-to-dock dash-to-dock@micxgx.gmail.com
+  install_ext home-sweet-gnome/dash-to-panel dash-to-panel@jderose9.github.com
+  install_ext hermes83/compiz-alike-magic-lamp-effect compiz-alike-magic-lamp-effect@hermes83.github.com
+  cwe_suf=$([ \"$SVER\" -ge 50 ] && echo 50 || echo 49); install_ext hermes83/compiz-windows-effect compiz-windows-effect@hermes83.github.com 'compiz-windows-effect@hermes83.github.com.$cwe_suf.zip'
+  install_ext velade/dynamic-panel dynamic-panel@velhlkj.com
+  install_ext jdneer/gnome-dynamic-panel-ng dynamic-panel-ng@jdneer.com
+  rm -rf \"$STAGE\"
+  echo 'GS-EXT-DONE: extension installs attempted'" ]

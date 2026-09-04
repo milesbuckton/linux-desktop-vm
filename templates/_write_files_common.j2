@@ -1,0 +1,123 @@
+  # Login banner: agetty expands \4 to the first UP interface's IPv4 each
+  # time the login prompt is rendered, so the IP shown is always current.
+  - path: /etc/issue
+    permissions: "0644"
+    content: |
+      \S \r (\l)
+
+        IP:   \4
+        SSH:  ssh {{ USERNAME }}@\4
+        Run 'check-vm' to verify install health.
+
+  # Post-install diagnostic helper: shows cloud-init status, marker file,
+  # display manager state, guest agent, IP, and recent errors. Read-only;
+  # safe to run any time, including mid-cloud-init. Output is also tee'd
+  # to /var/log/check-vm.log so an SSH'd-in maintainer can fetch the
+  # most recent run without retyping the command.
+  - path: /usr/local/bin/check-vm
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      # check-vm: post-install diagnostic for cloud-init-built VMs.
+      # Read-only; safe to run any time, including mid-cloud-init.
+      # Mirrors stdout+stderr to /var/log/check-vm.log so the most-recent
+      # run is always available (overwritten each invocation).
+      LOG=/var/log/check-vm.log
+      if [ "$(id -u)" -eq 0 ]; then
+          exec > >(tee "$LOG") 2>&1
+      elif sudo -n true 2>/dev/null; then
+          exec > >(sudo tee "$LOG") 2>&1
+      else
+          # Non-root, no NOPASSWD sudo: fall back to a user-writable
+          # path so an SSH'd-in maintainer can always grab the log.
+          LOG="$HOME/check-vm.log"
+          exec > >(tee "$LOG") 2>&1
+      fi
+      echo "(check-vm output mirrored to $LOG)"
+      echo
+
+      echo "=== cloud-init status ==="
+      cloud-init status --long 2>/dev/null || echo "(cloud-init unreachable)"
+
+      echo
+      echo "=== marker file (last runcmd step) ==="
+      if ls /var/log/*-vm-setup.log >/dev/null 2>&1; then
+          ls -l /var/log/*-vm-setup.log
+          cat /var/log/*-vm-setup.log
+      else
+          echo "MISSING -- runcmd did NOT reach the end of the script"
+      fi
+
+      echo
+      echo "=== bootcmd log (pre-package fixes) ==="
+      if [ -f /var/log/cloud-init-bootcmd.log ]; then
+          sudo cat /var/log/cloud-init-bootcmd.log
+      else
+          echo "(no bootcmd log -- this template has no bootcmd block)"
+      fi
+
+      echo
+      echo "=== network: interfaces ==="
+      ip -br addr 2>/dev/null || ip addr | grep -E '^[0-9]+:|inet '
+
+      echo
+      echo "=== network: DNS ==="
+      if command -v resolvectl >/dev/null 2>&1; then
+          resolvectl status 2>/dev/null | head -25
+      else
+          cat /etc/resolv.conf 2>/dev/null
+      fi
+
+      echo
+      echo "=== network: connectivity ==="
+      ping -c2 -W2 1.1.1.1 2>&1 | tail -3
+      echo "--- name resolution ---"
+      getent hosts archive.ubuntu.com fedoraproject.org 2>&1 | head -3 \
+          || echo "(name resolution failed)"
+
+      echo
+      echo "=== display manager ==="
+      systemctl is-active gdm.service  2>/dev/null && echo "gdm.service:  active" || true
+      systemctl is-active gdm3.service 2>/dev/null && echo "gdm3.service: active" || true
+      echo "default target: $(systemctl get-default 2>/dev/null)"
+
+      echo
+      echo "=== package manager state ==="
+      if [ -f /etc/debian_version ]; then
+          echo "--- apt sources ---"
+          grep -hE '^[^#]' /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null | head -10
+          echo "--- /var/log/apt/history.log (last 20 lines) ---"
+          sudo tail -20 /var/log/apt/history.log 2>/dev/null || echo "(no apt history)"
+      else
+          echo "(non-Debian distro)"
+      fi
+
+      echo
+      echo "=== IP / SSH ==="
+      ip=$(ip -o -4 addr show scope global up 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+      [ -z "$ip" ] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+      user=$(id -un 1000 2>/dev/null || whoami)
+      echo "IP:  $ip"
+      echo "SSH: ssh ${user}@${ip}"
+
+      echo
+      echo "=== Errors in /var/log/cloud-init.log (last 15) ==="
+      sudo grep -iE 'error|fail|traceback' /var/log/cloud-init.log 2>/dev/null | tail -15 \
+          || echo "(no errors found)"
+
+      echo
+      echo "=== Errors in /var/log/cloud-init-output.log (with context) ==="
+      sudo grep -B2 -A8 -iE 'error|fail|signature|key|unable|cannot|denied' \
+          /var/log/cloud-init-output.log 2>/dev/null | head -300 \
+          || echo "(no output log or no matches)"
+
+      echo
+      echo "=== Tail of /var/log/cloud-init-output.log (last 80 lines) ==="
+      sudo tail -80 /var/log/cloud-init-output.log 2>/dev/null \
+          || echo "(no output log)"
+
+      echo
+      echo "For more detail:"
+      echo "  cloud-init status --long"
+      echo "  sudo less /var/log/cloud-init-output.log"
+      echo "  sudo journalctl -u cloud-init-final --no-pager"

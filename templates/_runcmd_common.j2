@@ -1,0 +1,30 @@
+  # Boot into the graphical target so the display manager actually starts.
+  - [ systemctl, set-default, graphical.target ]
+  # Display manager -- skip if the distro defers GDM enable to post_runcmd
+  # (e.g. Fedora where @workstation installs GDM in post_runcmd)
+{% if not skip_gdm_enable | default(false) %}
+  - [ systemctl, enable, --now, {{ gdm_service | default('gdm.service') }} ]
+{% endif %}
+{% if vmtools_service %}
+  # Guest agent service (qemu-guest-agent)
+  - [ systemctl, enable, {{ vmtools_service }} ]
+{% endif %}
+{% for svc in extra_enable_services | default([]) %}
+  - [ systemctl, enable, {{ svc }} ]
+{% endfor %}
+  # Enable PipeWire stack for all users (audio doesn't auto-start otherwise
+  # -- pipewire.socket / wireplumber are user services).
+  # Best-effort: on Fedora, @workstation hasn't installed
+  # pipewire yet at this point (it runs in post_runcmd). The user services
+  # will start on first login anyway via wireplumber.service.
+  - [ sh, -c, "systemctl --global enable pipewire.socket pipewire-pulse.socket wireplumber.service 2>&1 || true" ]
+  # Default the user to a GNOME (Wayland) session
+  - [ sh, -c, "mkdir -p /var/lib/AccountsService/users" ]
+  - [ sh, -c, "printf '[User]\nSession={{ default_session | default('gnome') }}\nXSession={{ default_session | default('gnome') }}\nSystemAccount=false\n' > /var/lib/AccountsService/users/{{ USERNAME }}" ]
+  # SELinux-only fix (no-op on Ubuntu/Debian, which have no restorecon):
+  # the shell redirect above labels the file var_lib_t, but accounts-daemon
+  # (accountsd) is AVC-denied from reading it in enforcing mode, so
+  # org.freedesktop.Accounts fails to activate and GDM exits with "Failed
+  # to contact accountsservice" -- crash-loop / boot halt.
+  - [ sh, -c, "command -v restorecon >/dev/null 2>&1 && restorecon -R /var/lib/AccountsService 2>/dev/null || true" ]
+

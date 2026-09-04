@@ -1,0 +1,32 @@
+{# ---------------------------------------------------------------------- #}
+{# Reusable Jinja2 macros for cloud-init verify gates.                    #}
+{# Import in any template: {% from '_macros.j2' import verify_gate_apt %} #}
+{# ---------------------------------------------------------------------- #}
+
+{# verify_gate_apt: final build-success gate for APT-based distros.
+   Checks that core GNOME components are installed via dpkg.
+   Usage: {{ verify_gate_apt() }}
+#}
+{% macro verify_gate_apt() %}
+  - [ sh, -c, "set -e ; fail() { echo \"VERIFY-FAIL: $1\" >&2 ; exit 1 ; } ;
+      dpkg -l gnome-software                2>/dev/null | grep -q '^ii' || fail 'gnome-software missing' ;
+      dpkg -l gnome-shell                   2>/dev/null | grep -q '^ii' || fail 'gnome-shell missing' ;
+      dpkg -l gdm3                          2>/dev/null | grep -q '^ii' || fail 'gdm3 missing' ;
+      dpkg -l gnome-control-center          2>/dev/null | grep -q '^ii' || fail 'gnome-control-center missing' ;
+      dpkg -l nautilus                      2>/dev/null | grep -q '^ii' || fail 'nautilus missing' ;
+      echo 'VERIFY-OK: all required components present'" ]
+{% endmacro %}
+
+{# verify_gate_rpm: final build-success gate for DNF-based distros.
+   Checks that core GNOME components are installed via rpm.
+   Usage: {{ verify_gate_rpm() }}
+#}
+{% macro verify_gate_rpm() %}
+  - [ sh, -c, "set -e ; fail() { echo \"VERIFY-FAIL: $1\" >&2 ; exit 1 ; } ;
+      rpm -q gnome-software                >/dev/null 2>&1 || fail 'gnome-software missing' ;
+      rpm -q gnome-shell                   >/dev/null 2>&1 || fail 'gnome-shell missing' ;
+      rpm -q gdm                           >/dev/null 2>&1 || fail 'gdm missing' ;
+      rpm -q gnome-control-center          >/dev/null 2>&1 || fail 'gnome-control-center missing' ;
+      rpm -q nautilus                      >/dev/null 2>&1 || fail 'nautilus missing' ;
+      echo 'VERIFY-OK: all required components present'" ]
+{% endmacro %}
