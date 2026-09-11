@@ -1,0 +1,30 @@
+{# ---------------------------------------------------------------------- #}
+{# Reusable Jinja2 macros for cloud-init verify gates.                    #}
+{# Import in any template: {% from '_macros.j2' import verify_gate_apt %} #}
+{# ---------------------------------------------------------------------- #}
+
+{# Verify-gate contract: the orchestrator's _check_success_marker (see
+   linux_vm/fleet/ssh.py) treats the build as success ONLY when this
+   macro's stdout contains the literal "VERIFY-OK: all required
+   components present" string. The `set -e` + `exit 1` from a
+   VERIFY-FAIL path is informational: cloud-init's own runcmd may
+   still report `done` because the verify block's non-zero exit does
+   not abort runcmd. The MARKER is the real build-success contract
+   (AGENTS.md "Verify-block: the build-success contract"). The
+   companion SIMULATE-OK / SIMULATE-FAIL markers are emitted by the
+   simulate-mode blocks per distro and gate the --simulate-only
+   fleet run. #}
+
+{# verify_gate_apt: final build-success gate for APT-based distros.
+   Checks that core GNOME components are installed via dpkg.
+   Usage: {{ verify_gate_apt() }}
+#}
+{% macro verify_gate_apt() %}
+  - [ sh, -c, "set -e ; fail() { echo \"VERIFY-FAIL: $1\" >&2 ; exit 1 ; } ;
+      dpkg -l gnome-software                2>/dev/null | grep -q '^ii' || fail 'gnome-software missing' ;
+      dpkg -l gnome-shell                   2>/dev/null | grep -q '^ii' || fail 'gnome-shell missing' ;
+      dpkg -l gdm3                          2>/dev/null | grep -q '^ii' || fail 'gdm3 missing' ;
+      dpkg -l gnome-control-center          2>/dev/null | grep -q '^ii' || fail 'gnome-control-center missing' ;
+      dpkg -l nautilus                      2>/dev/null | grep -q '^ii' || fail 'nautilus missing' ;
+      echo 'VERIFY-OK: all required components present'" ]
+{% endmacro %}
