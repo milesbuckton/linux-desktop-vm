@@ -1,0 +1,53 @@
+From cf0956a3f2f99acde623e74b38df5d0f1fb9d159
+From: Miles Buckton <miles@miles.dev>
+Date: Apple Silicon
+Subject: [PATCH] virtio: align blob and shmem allocations to 16KB for Apple Silicon
+
+Apple Silicon hosts use 16KB pages while aarch64 guests use 4KB pages.
+The guest kernel packs hostmem blobs at guest-page granularity, so a 4KB-
+aligned but not-16KB-aligned blob address causes MAP_FIXED to fail with
+EINVAL on Apple Silicon.
+
+Fix:
+- vn_renderer_virtgpu.c: align blob_size to 16KB in virtgpu_ioctl_resource_create_blob
+- vn_renderer_util.c: align shmem pool offset and size to 16KB in vn_renderer_shmem_pool_alloc
+
+This enables Venus (Vulkan) to work on Apple Silicon via QEMU HVF.
+
+Signed-off-by: Miles Buckton <miles@miles.dev>
+---
+ src/virtio/vulkan/vn_renderer_util.c    | 5 +++--
+ src/virtio/vulkan/vn_renderer_virtgpu.c | 2 +-
+ 2 files changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/src/virtio/vulkan/vn_renderer_util.c b/src/virtio/vulkan/vn_renderer_util.c
+index 5a86251a4a4..60805c38bdc 100644
+--- a/src/virtio/vulkan/vn_renderer_util.c
++++ b/src/virtio/vulkan/vn_renderer_util.c
+@@ -113,8 +113,9 @@ vn_renderer_shmem_pool_alloc(struct vn_renderer *renderer,
+
+    struct vn_renderer_shmem *shmem =
+       vn_renderer_shmem_ref(renderer, pool->shmem);
+-   *out_offset = pool->used;
+-   pool->used += size;
++   *out_offset = (pool->used + 16383) & ~16383;  /* Round up to 16KB for Apple Silicon */
++   size = (size + 16383) & ~16383;  /* Round up to 16KB for Apple Silicon */
++   pool->used = *out_offset + size;
+    mtx_unlock(&pool->mutex);
+
+    return shmem;
+diff --git a/src/virtio/vulkan/vn_renderer_virtgpu.c b/src/virtio/vulkan/vn_renderer_virtgpu.c
+index 9e233b560d3..71d5e4ba4e7 100644
+--- a/src/virtio/vulkan/vn_renderer_virtgpu.c
++++ b/src/virtio/vulkan/vn_renderer_virtgpu.c
+@@ -636,7 +636,7 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
+                                    uint32_t *res_id)
+ {
+ #ifdef SIMULATE_BO_SIZE_FIX
+-   blob_size = align64(blob_size, 4096);
++   blob_size = align64(blob_size, 16384);  // 16KB for Apple Silicon page alignment
+ #endif
+
+    struct drm_virtgpu_resource_create_blob args = {
+--
+2.50.1 (Apple Git-155)

@@ -1,0 +1,51 @@
+# Node
+node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# VM / build artifacts (these are produced by setup_vm.py — never commit them)
+*.qcow2
+*.img
+*.log
+*.fd
+launch-vm.sh
+seed.iso
+install-info.txt
+# Per-VM SSH key generated for monitor --tail. Lives in target_dir
+# alongside the other build artifacts; never reused across VMs; not
+# meant for anything beyond this specific VM's lifetime.
+ssh_key
+ssh_key.pub
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Poolside
+.poolside/
+
+# Local target dirs people commonly use
+VMs/
+out/
+build/
+dist/
+.opencode/
