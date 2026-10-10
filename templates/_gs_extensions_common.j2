@@ -1,0 +1,77 @@
+{# ---------------------------------------------------------------------- #}
+{# GNOME Shell extensions: install one curated extension (dash-to-dock)  #}
+{# from a GitHub-release ZIP. Included by ALL families.                  #}
+{#                                                                       #}
+{# Enablement happens separately via _dconf_common.j2 (system-wide       #}
+{# org.gnome.shell enabled-extensions default).                          #}
+{#                                                                       #}
+{# STRICTLY BEST-EFFORT per AGENTS: only dash-to-dock is curated.        #}
+{# Markers: GS-EXT-OK <uuid> / GS-EXT-SKIPPED <uuid> / GS-EXT-DONE.      #}
+{#                                                                       #}
+{# GATED ON install_dash_to_dock (set by each child template before this #}
+{# include): Ubuntu keeps its STOCK ubuntu-dock -- Ubuntu's session mode  #}
+{# (/usr/share/gnome-shell/modes/ubuntu.json) force-enables               #}
+{# ubuntu-dock@ubuntu.com, so installing dash-to-dock there too would      #}
+{# render TWO docks -- whereas Gentoo has no session-mode dock at all and  #}
+{# would be left with none. Same var drives the dconf enabled-extensions  #}
+{# list in _dconf_common.j2, so "installs" and "enables" can't drift.     #}
+{#                                                                       #}
+{# The shell-version check PIPES THROUGH `tr -d '\n'` and double-quotes #}
+{# the pattern -- TWO bugs made it reject every release regardless of     #}
+{# declared support:                                                    #}
+{#   1. grep is line-based and upstream ships PRETTY-PRINTED            #}
+{#      metadata.json ("shell-version": [ on one line, each version on  #}
+{#      its own), so the version could never appear on the key's line;  #}
+{#   2. the pattern was single-quoted, so bash never expanded $SVER and  #}
+{#      grep searched for a literal "$SVER" ($ = EOL anchor -> no hit). #}
+{# The match is now an EXACT quoted version inside the array ("50", or   #}
+{# "50.1"), so a shell-version of 5 can't prefix-match "50", and the     #}
+{# pattern carries no backslash escapes -- \d/\b are not portable ERE    #}
+{# (GNU grep reads \d as a literal 'd', BSD grep differs), which made    #}
+{# results grep-implementation dependent.                                #}
+{# Net effect: "latest release does not declare GNOME NN support" on     #}
+{# every distro even for a release declaring 45-51 (incl. 50/51).        #}
+{# Verified by tests/test_logic.py, which EXECUTES the rendered check    #}
+{# against a pretty-printed fixture rather than pattern-matching text.   #}
+{# ---------------------------------------------------------------------- #}
+{% if install_dash_to_dock | default(true) %}
+  - [ bash, -c, "SVER=$(gnome-shell --version 2>/dev/null | awk '{print int($3)}'); [ -z \"$SVER\" ] && SVER=0; STAGE=$(mktemp -d);
+  BASE_URL=\"{{ GNOME_EXT_URL | default('') }}\";
+  install_ext() {
+  repo=$1; uuid=$2; artifact=${3:-$uuid.zip};
+  [ -d \"/usr/share/gnome-shell/extensions/$uuid\" ] && { echo \"GS-EXT-SKIP: $uuid (already installed from distro package)\"; return 0; };
+  if [ -n \"$BASE_URL\" ]; then
+  url=\"$BASE_URL/$artifact\";
+  else
+  for attempt in 1 2; do
+  rel=$(curl -fsSL --max-time 60 \"https://api.github.com/repos/$repo/releases/latest\" 2>/dev/null) || { sleep 10; continue; };
+  url=$(printf '%s' \"$rel\" | grep -oE '\"browser_download_url\": *\"[^\"]+\\.zip\"' | head -1 | cut -d'\"' -f4);
+  [ -n \"$url\" ] && break;
+  sleep 10;
+  done;
+  fi;
+  [ -z \"$url\" ] && { echo \"GS-EXT-SKIPPED: $uuid (no reachable source)\"; return 0; };
+  for attempt in 1 2 3 4; do
+  rm -rf \"$STAGE/$uuid\"; mkdir -p \"$STAGE/$uuid\";
+  curl -fsSL --max-time 120 -o \"$STAGE/ext.zip\" \"$url\" || { sleep 8; continue; };
+  unzip -qo \"$STAGE/ext.zip\" -d \"$STAGE/$uuid\" 2>/dev/null || { sleep 5; continue; };
+  [ -f \"$STAGE/$uuid/metadata.json\" ] || { echo \"GS-EXT-SKIPPED: $uuid (downloaded zip lacks metadata.json)\"; return 0; };
+  if tr -d '\\n' < \"$STAGE/$uuid/metadata.json\" | grep -qE \"\\\"shell-version\\\"[^]]*\\\"$SVER([.][0-9]+)?\\\"\"; then
+  mkdir -p /usr/share/gnome-shell/extensions;
+  rm -rf \"/usr/share/gnome-shell/extensions/$uuid\";
+  mv \"$STAGE/$uuid\" \"/usr/share/gnome-shell/extensions/$uuid\";
+  echo \"GS-EXT-OK: $uuid installed (shell $SVER)\";
+  return 0;
+  else
+  echo \"GS-EXT-SKIPPED: $uuid (latest release does not declare GNOME $SVER support)\";
+  return 0;
+  fi;
+  done;
+  echo \"GS-EXT-SKIPPED: $uuid (download failed after retries)\";
+  };
+  install_ext micheleg/dash-to-dock dash-to-dock@micxgx.gmail.com;
+  rm -rf \"$STAGE\";
+  echo 'GS-EXT-DONE: extension installs attempted'" ]
+{% else %}
+  - [ sh, -c, "echo 'GS-EXT-SKIPPED: dash-to-dock@micxgx.gmail.com (install gated off for this distro: stock dock kept)'" ]
+{% endif %}

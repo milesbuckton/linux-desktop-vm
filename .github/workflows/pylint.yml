@@ -1,0 +1,57 @@
+name: Pylint
+
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.14"]
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        # Full history so the pushed range (before..sha) resolves; the repo
+        # is tiny, so a deep clone costs nothing.
+        fetch-depth: 0
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    - name: Analysing changed code with pylint
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        BEFORE_SHA: ${{ github.event.before }}
+      run: |
+        set -euo pipefail
+        if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+          # Manual run = explicit request to validate everything: whole tree.
+          echo "Manual dispatch: linting every tracked Python file"
+          python scripts/lint-python.py
+          exit 0
+        fi
+        # push -> only the files that push changed (before..HEAD, so a
+        # multi-commit push is covered by one run). The script falls back to
+        # a full scan when the ref cannot resolve (root commit, force-push,
+        # first-push all-zero sha), so a run can never report success
+        # without having checked something.
+        echo "Push: linting Python files changed since $BEFORE_SHA"
+        python scripts/lint-python.py --changed-since "$BEFORE_SHA"
+    - name: Unit tests
+      # ALWAYS the whole suite, on every event. Unlike pylint there is no
+      # "changed files" mode: these tests assert build-verdict behaviour
+      # (cleanup of a leaked VM, the cloud-init status ladder, flag
+      # validation), so any subset can pass while the thing under test
+      # regressed. They are also the only coverage of linux_vm/fleet/.
+      run: python scripts/run-tests.py
+    - name: Template lint (Gate 0)
+      # Renders every distro in real + simulate mode, yaml-parses it,
+      # shell-lints every runcmd/bootcmd script, checks simulate-vs-real
+      # package parity, and re-renders with hostile password shapes. No
+      # network, no VM -- this is the gate that catches a template that
+      # would ship broken to an overnight fleet build.
+      run: python scripts/lint-templates.py

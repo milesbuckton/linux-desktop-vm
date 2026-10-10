@@ -1,0 +1,611 @@
+"""SSH-based orchestration helpers: DNS check, SSH readiness, cloud-init
+monitoring, marker verification, and diagnostic capture."""
+from __future__ import annotations
+import json
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+from .constants import SSH, MASTER_LOG
+from .executor import run_with_hard_timeout
+
+
+def log_master(msg: str) -> None:
+    """Write one timestamped line to the fleet master log AND stdout.
+
+    Mirrors the pre-refactor behaviour exactly: raw line to stdout with a
+    flush (no ANSI colour / log() wrapper) so piped and redirected output
+    stays greppable, plus an append to MASTER_LOG (OUT_ROOT/build-fleet.log).
+
+    Best-effort on the file side: ~/VMs is created by ensure_out_root(), but a
+    failure to write the master log must not take down the run it is
+    describing -- the stdout copy is still emitted.
+    """
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}\n"
+    try:
+        MASTER_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with MASTER_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+    except OSError:
+        pass
+    sys.stdout.write(line)
+    sys.stdout.flush()
+
+
+def ssh_cmd(host: str, port: int, username: str, ssh_key: str | Path,
+             remote_cmd: str, *, connect_timeout: int = 30,
+             server_alive: bool = False, batch_mode: bool = True) -> list[str]:
+    """Build the canonical `ssh` argv used across the fleet orchestrator.
+
+    Centralising the option block keeps the 7 call sites from drifting
+    (a missing BatchMode / ServerAlive flag at one site was a real bug).
+    """
+    # StrictHostKeyChecking=no + UserKnownHostsFile=/dev/null is the right
+    # call for ephemeral per-VM keys: the SSH fingerprint changes on every
+    # build (the per-VM ed25519 key is freshly generated), so TOFU isn't
+    # useful. The threat is a compromised guest MITMing our *next* fleet
+    # build -- acceptable because the per-VM SSH key only authenticates
+    # the freshly-provisioned guest and grants no other trust.
+    opts = [
+        "-i", str(ssh_key),
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", f"ConnectTimeout={connect_timeout}",
+    ]
+    if server_alive:
+        opts += ["-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3"]
+    if batch_mode:
+        opts += ["-o", "BatchMode=yes"]
+    opts += ["-p", str(port), f"{username}@{host}"]
+    return [SSH, *opts, remote_cmd]
+
+
+def check_guest_dns(host: str, port: int, username: str, ssh_key_str: str, mirror: str) -> bool:
+    """SSH into the guest and verify DNS resolves the distro's mirror."""
+    cmd = ssh_cmd(
+        host, port, username, ssh_key_str,
+        f"getent hosts {mirror}",
+        connect_timeout=10,
+    )
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            return True
+        print(f"  guest DNS check: getent hosts {mirror} -> exit {r.returncode}: {r.stderr.strip()}")
+    except Exception as e:
+        print(f"  guest DNS check: {e}")
+    return False
+
+
+def wait_ssh_reachable(host: str, port: int, timeout: int) -> str | None:
+    """Wait for TCP port `port` to accept connections on `host`.
+
+    Returns the host that became reachable, or None on timeout.
+    """
+    deadline = time.time() + timeout
+    current = host
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((current, port), timeout=5):
+                return current
+        except Exception:
+            pass
+        time.sleep(5)
+    return None
+
+
+def _descendants_of(pid: int) -> list[int]:
+    """Return every descendant PID of `pid` (children, grandchildren, ...).
+
+    A single `pgrep -P` level is not enough: our own `ssh` client can be
+    reaped while its `ControlMaster`/proxy grandchild survives, which is
+    exactly the orphan this function exists to clean up.
+    """
+    found: list[int] = []
+    seen: set[int] = set()
+    frontier = [pid]
+    while frontier:
+        current = frontier.pop()
+        try:
+            result = subprocess.run(
+                ["pgrep", "-P", str(current)],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception:
+            break
+        for token in result.stdout.split():
+            if not token.isdigit():
+                continue
+            child = int(token)
+            if child in seen or child == os.getpid():
+                continue
+            seen.add(child)
+            found.append(child)
+            frontier.append(child)
+    return found
+
+
+def _kill_ssh_child_processes(ssh_key: Path) -> None:
+    """Kill orphaned `ssh` clients belonging to this VM's key.
+
+    Only processes in THIS process's own tree are eligible, which is the
+    set the orchestrator can actually have leaked: `run_with_hard_timeout`
+    reaps the `ssh` it spawned, but a timeout kill or an exception path
+    can leave the client (or its proxy grandchild) running, and a live
+    ssh keeps the guest-side fleet-sshd listener warm through a build.
+
+    Scoping to our descendants is also what makes this safe for the
+    operator. The previous implementation matched
+    `pgrep -f "ssh.*<key path>"` -- a full-argv regex against EVERY
+    process on the host -- and its docstring claimed the per-VM key path
+    made it "never match an unrelated interactive session". That claim is
+    false: `pgrep -f` matches the whole command line, and the day-2 SSH
+    command documented in README.md (`ssh -i ~/VMs/<distro>/ssh_key -p
+    2222 <user>@127.0.0.1`) is the same key, so an operator interactively
+    logged into a VM being watched had their session SIGKILLed on every
+    5-minute probe of `ssh_wait_cloud_init`.
+    """
+    try:
+        ssh_key_str = str(ssh_key)
+        for pid in _descendants_of(os.getpid()):
+            try:
+                # /proc is Linux-only; fall back to matching a benign
+                # `ps` output shape. Either way the PID is already known to
+                # be our own descendant, so a matching failure only means a
+                # (rare) child we leave running -- never an unrelated one.
+                cmdline = Path(f"/proc/{pid}/cmdline")
+                if cmdline.exists():
+                    text = cmdline.read_bytes().decode(
+                        "utf-8", errors="replace").replace("\0", " ")
+                else:
+                    proc = subprocess.run(
+                        ["ps", "-p", str(pid), "-o", "args="],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    text = (proc.stdout or "").strip()
+            except Exception:
+                continue
+            if not text:
+                continue
+            # Match the per-VM private key as a WHOLE ARGUMENT, not as a
+            # substring of the command line and not by argv[0]. Every ssh
+            # invocation in this module passes it as `-i <key>`, and the key
+            # path is unique to this target dir, so any descendant carrying
+            # it is one of our clients -- including one reached through a
+            # wrapper or an absolute path, which an argv[0] basename check
+            # would miss.
+            if ssh_key_str not in text.split():
+                continue
+            try:
+                subprocess.run(["kill", "-9", str(pid)],
+                               capture_output=True, timeout=5)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _check_success_marker(host: str, port: int, username: str, ssh_key: Path,
+                          log_path: Path,
+                          marker: str = "VERIFY-OK: all required components present",
+                          target_dir: Path | None = None) -> bool:
+    """Return True if `marker` was emitted to cloud-init-output.log.
+
+    Also checks /var/log/verify-marker.log, which distro verify blocks write
+    (fsync'd) in addition to stdout. On long-running builds (notably Gentoo,
+    whose runcmd waits ~40 min for the install service) cloud-init's stdout
+    buffering can drop the final verify echo before this grep runs; the marker
+    file is durably on disk the instant the verify entry returns, so it is the
+    authoritative source.
+    """
+    # --- Primary: SSH into guest and grep cloud-init-output.log (and the marker file) ---
+    # SSH may be flaky under heavy load.
+    # Retry up to 3 times with 10s delays to ride out transient outages.
+    #
+    # The remote command has NO `|| echo` fallback and NO 2>&1: both used to
+    # destroy the only usable signal. `|| echo NO_MARKER` made the ssh exit
+    # status unconditionally 0, so the `rc == 0` half of the test could never
+    # discriminate -- the verdict was decided purely by `marker in stdout`
+    # over a stream that had grep's own error messages merged into it. With
+    # the fallbacks gone, stdout holds ONLY the lines grep matched, so
+    # `marker in stdout` is the verdict and grep's rc is diagnostic.
+    #
+    # rc is deliberately NOT part of the pass test: grep exits 2 when ANY of
+    # its files is unreadable EVEN IF another matched, and only gentoo.j2
+    # writes /var/log/verify-marker.log (ubuntu.j2's verify block -- the
+    # _macros.j2 `emit`-less one -- only echoes to stdout). A real Ubuntu
+    # build therefore always returns rc=2, so requiring rc == 0 here would
+    # report every Ubuntu build as FAILED. rc outside (0, 1, 2) -- including
+    # run_with_hard_timeout's -99/-98 -- does mean grep may never have run, so
+    # it is noted for the operator and treated as "no marker".
+    for _ssh_attempt in range(3):
+        try:
+            rc, stdout, stderr = run_with_hard_timeout(
+                ssh_cmd(
+                    host, port, username, ssh_key,
+                    f"sudo -n grep -F {shlex.quote(marker)} /var/log/cloud-init-output.log /var/log/verify-marker.log",
+                    server_alive=True,
+                ),
+                timeout_sec=30,
+            )
+            if marker in (stdout or ""):
+                return True
+            if rc not in (0, 1, 2):
+                # grep never ran (ssh refused, sudo -n failed, ...) --
+                # worth knowing in the log rather than silently concluding
+                # "marker absent".
+                _note(log_path, f"marker grep rc={rc}: {(stderr or '').strip()[:200]}")
+        except Exception:
+            pass
+        if _ssh_attempt < 2:
+            time.sleep(10)
+    # --- Fallback: read host-side console.log when SSH is dead ---
+    if target_dir is not None:
+        console_log = target_dir / "console.log"
+        if console_log.exists():
+            try:
+                # Read last 200KB to avoid scanning huge logs from the top.
+                # VERIFY-OK always appears near the end (last runcmd).
+                with open(console_log, "rb") as f:
+                    f.seek(0, 2)  # end
+                    size = f.tell()
+                    f.seek(max(0, size - 200_000))
+                    tail = f.read().decode("utf-8", errors="replace")
+                if marker in tail:
+                    with log_path.open("a", encoding="utf-8") as fh:
+                        fh.write(f"[{datetime.now().strftime('%H:%M:%S')}] SSH dead -- marker '{marker}' found in console.log fallback\n")
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def _note(log_path: Path, msg: str) -> None:
+    """Append one timestamped line to log_path. Never raises.
+
+    Evidence capture must not be able to throw: a failure to append a note
+    is strictly less important than the verdict its caller already computed.
+    """
+    try:
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
+    except OSError:
+        pass
+
+
+def _snapshot_cloud_init_status(host: str, port: int, username: str, ssh_key: Path,
+                                log_path: Path, target_dir: Path | None) -> None:
+    """Capture the guest's cloud-init status.json before the VM is shut down.
+
+    Why this exists: `/var/lib/cloud/data/status.json` (symlinked from
+    `/run/cloud-init/status.json`) is REWRITTEN on every boot, so the
+    `recoverable_errors` that made a finished build report `degraded done`
+    are destroyed the instant the VM is re-booted to inspect it. The
+    orchestrator is the only process that reliably holds SSH at the exact
+    moment cloud-init finishes while the guest is still up -- so snapshot it
+    here rather than relying on a later manual look.
+
+    Two effects:
+      * raw JSON written to `<target_dir>/cloud-init-status.json` (fallback:
+        next to `log_path`) for post-mortem forensics;
+      * a summary line appended to `log_path`, and a `log_master` WARN when
+        `errors`/`recoverable_errors` are non-empty -- so a genuinely
+        degraded build is no longer silently treated as clean.
+
+    Never raises: this is best-effort evidence capture, and a failure here
+    must not mask the verdict the caller already computed.
+    """
+    dest = (target_dir if target_dir is not None else log_path.parent) / (
+        "cloud-init-status.json" if target_dir is not None
+        else f"{log_path.stem}.cloud-init-status.json"
+    )
+    cmd = ssh_cmd(
+        host, port, username, ssh_key,
+        "sudo -n cat /var/lib/cloud/data/status.json 2>/dev/null || "
+        "sudo -n cat /run/cloud-init/status.json 2>/dev/null || true",
+        server_alive=True,
+    )
+    try:
+        rc, stdout, _stderr = run_with_hard_timeout(cmd, timeout_sec=40)
+    except Exception as e:  # noqa: BLE001 - never propagate
+        _note(log_path, f"status snapshot FAILED: {type(e).__name__}: {e}")
+        return
+
+    text = (stdout or "").strip()
+    # SSH warnings/errors can precede the payload; JSON starts at the first '{'.
+    start = text.find("{")
+    if rc != 0 or start < 0:
+        # The remote command ends in `|| true`, so rc==0 does NOT prove the
+        # file existed -- `cat A || cat B || true` returns 0 whether or not
+        # either cat succeeded. Existence is therefore decided by the payload
+        # itself, and an absent status.json is reported as such rather than
+        # being summarised as a clean build.
+        _note(log_path, f"status snapshot: no status.json captured "
+                        f"(ssh rc={rc}, {len(text)} bytes of output)")
+        return
+
+    # Parse BEFORE writing. The old order wrote the raw text to dest first and
+    # parsed afterwards, so two things went wrong on unparseable input: a
+    # garbage snapshot OVERWROTE whatever good evidence was there, and the
+    # except branch set v1={} and went on to summarise that as
+    # "errors=0 recoverable={}" -- i.e. a build whose status we could not
+    # read was reported identically to a perfectly clean one. Anything that
+    # does not parse is kept as a .unparsed sidecar for forensics and the
+    # wait is told the status is UNKNOWN.
+    try:
+        data = json.loads(text[start:])
+    except ValueError as e:
+        bad = dest.with_suffix(".json.unparsed")
+        try:
+            bad.write_text(text[start:] + "\n", encoding="utf-8")
+            _note(log_path, f"status snapshot: UNPARSEABLE ({e}) -- "
+                            f"kept raw at {bad}; status UNKNOWN")
+        except OSError as we:
+            _note(log_path, f"status snapshot: UNPARSEABLE ({e}); "
+                            f"could not keep raw copy either ({we})")
+        try:
+            log_master(f"WARN: cloud-init status.json did not parse ({e}) -- "
+                       f"build status UNKNOWN, not clean; raw at {bad}")
+        except OSError:
+            pass
+        return
+
+    # Validated-then-written: the file still holds the guest's raw bytes
+    # (nothing re-serialised, so the snapshot is what the guest actually had),
+    # it just does not exist unless it parsed.
+    try:
+        dest.write_text(text[start:] + "\n", encoding="utf-8")
+    except OSError as e:
+        _note(log_path, f"status snapshot: could not write {dest}: {e}")
+        return
+
+    # Aggregate across every stage exactly like cloudinit/cmd/status.py does:
+    # v1 also holds non-dict entries ('datasource' str, 'stage' None) which we skip.
+    v1 = data.get("v1", {})
+    errors: list[str] = []
+    recoverable: dict[str, list[str]] = {}
+    if isinstance(v1, dict):
+        for stage_key, stage_val in v1.items():
+            if not isinstance(stage_val, dict):
+                continue
+            for err in stage_val.get("errors") or []:
+                errors.append(f"{stage_key}: {err}")
+            for level, msgs in (stage_val.get("recoverable_errors") or {}).items():
+                recoverable.setdefault(level, []).extend(
+                    f"{stage_key}: {m}" for m in (msgs or [])
+                )
+
+    summary = (
+        f"errors={len(errors)} recoverable="
+        + ("{" + ", ".join(f"{k}:{len(v)}" for k, v in sorted(recoverable.items())) + "}" if recoverable else "{}")
+    )
+    _note(log_path, f"cloud-init status snapshot -> {dest} ({summary})")
+    for level, msgs in sorted(recoverable.items()):
+        for msg in msgs:
+            _note(log_path, f"  {level}: {msg}")
+    for err in errors:
+        _note(log_path, f"  ERROR: {err}")
+
+    if errors or recoverable:
+        try:
+            log_master(
+                f"WARN: cloud-init reported {summary} -- build may be degraded; "
+                f"details in {log_path}, raw status at {dest}"
+            )
+        except OSError:
+            pass
+
+
+def ssh_wait_cloud_init(host: str, port: int, username: str, ssh_key: Path, log_path: Path, overall_timeout_sec: int,
+                        marker: str = "VERIFY-OK: all required components present",
+                        target_dir: Path | None = None) -> tuple[int, float]:
+    """Poll cloud-init readiness, then snapshot status.json before returning.
+
+    The snapshot runs in a `finally` so EVERY exit path (success, terminal
+    failure, timeout, unexpected exception) preserves the guest's
+    `recoverable_errors` -- the evidence is worthless once the VM reboots.
+    """
+    try:
+        return _ssh_wait_cloud_init(
+            host, port, username, ssh_key, log_path, overall_timeout_sec,
+            marker=marker, target_dir=target_dir,
+        )
+    finally:
+        _snapshot_cloud_init_status(host, port, username, ssh_key, log_path, target_dir)
+
+
+def _ssh_wait_cloud_init(host: str, port: int, username: str, ssh_key: Path, log_path: Path, overall_timeout_sec: int,
+                        marker: str = "VERIFY-OK: all required components present",
+                        target_dir: Path | None = None) -> tuple[int, float]:
+    """Poll cloud-init readiness via short SSH commands.
+
+    Decision based on cloud-init's `extended_status` field (not just exit code):
+      * extended_status: done            -> SUCCESS only if the VERIFY-OK/SIMULATE-OK marker is present (return 0); otherwise FAIL (return 1)
+      * extended_status: error - done    -> SUCCESS only if the marker is present (return 0); otherwise TERMINAL FAILURE (return 1)
+      * extended_status: error - running -> cloud-init had a non-fatal error
+                                            (e.g. bootcmd) BUT is still working --
+                                            KEEP WAITING
+      * extended_status: running         -> normal, keep waiting
+      * exit code 0/2 / SSH transient    -> keep waiting
+
+    On terminal failure we dump:
+      - last 200 lines of /var/log/cloud-init.log
+      - /var/log/cloud-init-bootcmd.log (our bootcmd scripts redirect to this)
+      - journalctl -p err for cloud-init services
+    """
+    overall_start = time.time()
+    deadline = overall_start + overall_timeout_sec
+    while time.time() < deadline:
+        try:
+            _kill_ssh_child_processes(ssh_key)
+
+            rc, stdout, stderr = run_with_hard_timeout(
+                ssh_cmd(
+                    host, port, username, ssh_key,
+                    "sudo -n cloud-init status --long",
+                    server_alive=True,
+                    connect_timeout=90,
+                ),
+                timeout_sec=120,
+            )
+            stdout = stdout.strip()
+            ext_m = re.search(r"^extended_status:\s*(.+)$", stdout, re.MULTILINE)
+            extended = ext_m.group(1).strip() if ext_m else "(no extended_status)"
+            # Log EVERY probe (no backoff, no state-change-only logging) so
+            # the operator can see the orchestrator is actually working.
+            # Probe interval is fixed at 5 min below, so this writes one
+            # line every 5 min during a wait -- plenty of visibility.
+            now = time.time()
+            with log_path.open("a", encoding="utf-8") as fh:
+                # rc=-99 means our hard timeout fired (ssh stuck). rc=-98 means
+                # other Popen exception. Either way the probe is unreliable;
+                # log so the operator sees we're not silently stuck.
+                probe_tag = " HARD-TIMEOUT" if rc == -99 else (" POPEN-EXC" if rc == -98 else "")
+                fh.write(f"[{datetime.now().strftime('%H:%M:%S')}] elapsed={int(now-overall_start)}s rc={rc} extended_status={extended!r}{probe_tag}\n")
+            # Determine state. cloud-init's `extended_status` ladder:
+            #   running              -> still working
+            #   degraded running     -> still working + non-fatal warnings
+            #   done                 -> finished cleanly, BUT only SUCCESS if our
+            #                             runcmd success marker is present (cloud-init
+            #                             reports `done` even when the verify block
+            #                             emitted VERIFY-FAIL, since the block didn't
+            #                             abort runcmd with a non-zero exit)
+            #   degraded done        -> finished, but had non-fatal recoverable_errors
+            #                             (SUCCESS only if marker present)
+            #   error - done         -> terminal failure -- BUT first check our
+            #                           runcmd success marker (cloud-init may
+            #                           flag error because of a single noisy
+            #                           postinst even though our user-data
+            #                           runcmd block ran through to completion)
+            if "error - done" in extended:
+                # Cloud-init thinks it failed. Check if our final_message
+                # ("<Distro> + GNOME setup complete after N seconds.") made
+                # it to cloud-init-output.log. If so, our runcmd reached the
+                # end -- treat as success-with-warnings, but STILL capture
+                # diagnostics so the operator can post-mortem which package
+                # postinst tripped cloud-init's error flag (useful for
+                # tightening templates later).
+                marker_ok = _check_success_marker(host, port, username, ssh_key, log_path,
+                                                  marker=marker, target_dir=target_dir)
+                if marker_ok:
+                    with log_path.open("a", encoding="utf-8") as fh:
+                        fh.write(f"[{datetime.now().strftime('%H:%M:%S')}] cloud-init flagged 'error - done' BUT success marker present in cloud-init-output.log -- treating as success-with-warnings\n")
+                        fh.write(f"[{datetime.now().strftime('%H:%M:%S')}] capturing diagnostics anyway for post-mortem ...\n")
+                    _capture_diagnostics(host, port, username, ssh_key, log_path, stdout)
+                    return 0, time.time() - overall_start
+                _capture_diagnostics(host, port, username, ssh_key, log_path, stdout)
+                return 1, time.time() - overall_start
+            if extended in ("done", "degraded done"):
+                # SUCCESS only if our runcmd success marker is present.
+                # cloud-init reports `done` even when the verify block emitted
+                # VERIFY-FAIL (the block didn't abort runcmd with a non-zero
+                # exit), so a plain `done` is NOT sufficient -- the marker is
+                # the real build-success contract (AGENTS.md). A `done` without
+                # the marker means the install half-failed; treat as FAILED.
+                marker_ok = _check_success_marker(host, port, username, ssh_key, log_path, marker=marker, target_dir=target_dir)
+                if marker_ok:
+                    return 0, time.time() - overall_start
+                with log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(f"[{datetime.now().strftime('%H:%M:%S')}] cloud-init status '{extended}' BUT success marker '{marker}' ABSENT in cloud-init-output.log -- treating as FAILED\n")
+                _capture_diagnostics(host, port, username, ssh_key, log_path, stdout)
+                return 1, time.time() - overall_start
+            # Fallback: if cloud-init stays in running/degraded running
+            # past the expected runcmd completion time, or if SSH is
+            # unreachable (extended='(no extended_status)'), do a secondary
+            # check for VERIFY-OK / SIMULATE-OK in cloud-init-output.log.
+            # The verify block runs as the last runcmd entry; if the marker
+            # is present, our user-data runcmd completed successfully even
+            # if cloud-init is stuck on a post-runcmd module (final_message,
+            # phone_home, scripts-per-instance, etc.) and never transitions
+            # to `done`, or if sshd is overwhelmed by install load.
+            # 15 min (900s) is well past any distro's verify-block timing
+            # and avoids false-triggers from pre-runcmd log content.
+            if (time.time() - overall_start) > 900:
+                marker_ok = _check_success_marker(host, port, username, ssh_key, log_path, marker=marker, target_dir=target_dir)
+                if marker_ok:
+                    with log_path.open("a", encoding="utf-8") as fh:
+                        fh.write(f"[{datetime.now().strftime('%H:%M:%S')}] extended_status={extended!r} BUT success marker present in cloud-init-output.log -- treating as completed\n")
+                    return 0, time.time() - overall_start
+            # Everything else (running / degraded running / error - running / unknown) -> keep waiting
+        except Exception as e:
+            with log_path.open("a", encoding="utf-8") as fh:
+                fh.write(f"[{datetime.now().strftime('%H:%M:%S')}] probe exception: {type(e).__name__}: {e}\n")
+            # Exception probe: try marker check as fallback if SSH is
+            # unreachable (probe crashed) but we're past the runcmd window.
+            if (time.time() - overall_start) > 900:
+                try:
+                    marker_ok = _check_success_marker(host, port, username, ssh_key, log_path, marker=marker, target_dir=target_dir)
+                    if marker_ok:
+                        with log_path.open("a", encoding="utf-8") as fh:
+                            fh.write(f"[{datetime.now().strftime('%H:%M:%S')}] probe exception BUT success marker present in cloud-init-output.log -- treating as completed\n")
+                        return 0, time.time() - overall_start
+                except Exception:
+                    pass
+        # Check deadline BEFORE sleeping, and clamp the sleep so a probe
+        # ending near the deadline doesn't overshoot it by up to 5 min.
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(300, remaining))  # 5 min between probes -- no backoff; matches the
+                                         # operator-visible heartbeat cadence above
+    return -1, time.time() - overall_start
+
+
+def _capture_diagnostics(host: str, port: int, username: str, ssh_key: Path,
+                         log_path: Path, last_status: str) -> None:
+    """Dump diagnostics on terminal cloud-init failure."""
+    diag_cmd = (
+        "echo '=== cloud-init status --long ==='; "
+        "sudo -n cloud-init status --long 2>&1 || true; "
+        "echo '=== /var/log/cloud-init-bootcmd.log (our bootcmd output) ==='; "
+        "sudo -n cat /var/log/cloud-init-bootcmd.log 2>&1 || echo '(no bootcmd log file)'; "
+        # cloud-init-output.log captures the literal stdout/stderr of every
+        # command cloud-init runs (apt-get install, emerge, etc.). When
+        # `cc_package_update_upgrade_install` reports a ProcessExecutionError
+        # with empty Stdout/Stderr, the actual error text is in THIS file --
+        # the cloud-init internal journal in cloud-init.log only sees the
+        # exit code. Grep for typical package-manager error markers so we
+        # surface the real cause (Unable to locate package, Hash Sum
+        # mismatch, conflicting decisions, Cannot install, Failed to fetch).
+        "echo '=== /var/log/cloud-init-output.log (packager ERRORS only) ==='; "
+        "sudo -n grep -E '^E:|^W:|^Err:|^N:|Unable to|Hash Sum|broken|conflict|no installation candidate|Could not|Cannot|Failed to|^Error:|^Failed:|^Problem:|^ Problem' /var/log/cloud-init-output.log 2>&1 | tail -100 || true; "
+        "echo '=== last 60 lines of /var/log/cloud-init-output.log (raw tail) ==='; "
+        "sudo -n tail -60 /var/log/cloud-init-output.log 2>&1 || true; "
+        "echo '=== last 80 lines of /var/log/cloud-init.log (ERRORS only) ==='; "
+        "sudo -n grep -E 'ERROR|WARNING|FAIL|Traceback' /var/log/cloud-init.log 2>&1 | tail -80 || true; "
+        "echo '=== journalctl err for cloud-init ==='; "
+        "sudo -n journalctl -u cloud-init -u cloud-init-local -u cloud-final -u cloud-config --no-pager -p err -n 50 2>&1 || true; "
+        # /var/log/install-simulate.log is where the simulate-mode runcmd
+        # redirects apt-get install --simulate / emerge --pretend /
+        # simulate dry-run output. The marker SIMULATE-OK / SIMULATE-FAIL
+        # lines go to cloud-init-output.log, but the actual resolver errors
+        # (missing atoms, masked packages, USE-flag conflicts, dep cycles)
+        # only land in install-simulate.log.
+        # Without dumping this file, the orchestrator's FAIL report has
+        # no actionable detail beyond "resolver failed".
+        "echo '=== last 100 lines of /var/log/install-simulate.log (the resolver dry-run output) ==='; "
+        "sudo -n tail -100 /var/log/install-simulate.log 2>&1 || echo '(no install-simulate.log -- simulate runcmd may not have fired)'; "
+    )
+    try:
+        rc, stdout, stderr = run_with_hard_timeout(
+            ssh_cmd(host, port, username, ssh_key, diag_cmd, server_alive=True),
+            timeout_sec=180,
+        )
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n=== TERMINAL FAILURE DIAGNOSTIC ({datetime.now().strftime('%H:%M:%S')}) ===\n")
+            fh.write(f"last cloud-init status output:\n{last_status}\n\n")
+            fh.write("--- remote diagnostic ---\n")
+            fh.write(stdout)
+            if stderr:
+                fh.write(f"\n--- diag stderr ---\n{stderr}\n")
+            fh.write("\n=== end diagnostic ===\n")
+    except Exception as e:
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n=== DIAGNOSTIC CAPTURE FAILED: {type(e).__name__}: {e} ===\n")
