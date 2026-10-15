@@ -1,0 +1,32 @@
+# Host + CI dependencies for linux-desktop-vm.
+#
+# Everything here is also bootstrapped at runtime by linux_vm.host
+# (_pip_install / ensure_* helpers), so this file is NOT a required setup
+# step -- it exists so a machine, a CI runner, or a teammate can install
+# the full set in one command instead of discovering the dependency list
+# from ImportError messages one at a time:
+#
+#     python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#
+# Keep the list minimal: every entry is imported by a gate or by
+# setup_vm.py at runtime, and Gate 0c (pylint) needs pylint specifically
+# because a missing pylint is exit 2, never a pass.
+
+# Gate 0 (scripts/lint-templates.py) + Gate 0b (scripts/audit-packages.py):
+# cloud-init user-data is rendered and yaml.safe_load'd on every gate run.
+Jinja2>=3.1
+PyYAML>=6.0
+
+# setup_vm.py: builds the NoCloud seed ISO for every VM.
+pycdlib>=1.14
+
+# TLS for image/extension downloads. Used when present so a host with a
+# stale system CA store still verifies; host.py falls back to the stdlib
+# context when it is missing.
+certifi>=2024.2.2
+
+# `setup_vm.py --tail` progress monitor (paramiko SSH client).
+paramiko>=3.4
+
+# Gate 0c (scripts/lint-python.py) -- full-tree pylint, the hard-fail gate.
+pylint>=3.0

@@ -1,0 +1,456 @@
+{% extends '_base.j2' %}
+
+{% set marker_name = marker_name | default('ubuntu') %}
+{% set display_name = display_name | default('Ubuntu') %}
+{% set default_session = 'ubuntu' %}
+
+{% set user_groups = user_groups | default(['sudo', 'audio', 'video', 'render', 'plugdev', 'netdev']) %}
+{% set gdm_service = 'gdm3.service' %}
+
+{% set _chrome_install_cmd = 'apt-get install -y google-chrome-stable' %}
+
+{%- set guest_agent_packages = ['spice-vdagent'] %}
+{%- set vmtools_service = '' %}
+{%- set extra_enable_services = ['spice-vdagentd.service'] %}
+
+{% set plymouth_theme = 'spinner' %}
+{% set plymouth_set_theme = 'update-alternatives --set default.plymouth /usr/share/plymouth/themes/spinner/spinner.plymouth' %}
+{% set plymouth_grub_args = 'splash quiet video=3456x2234@60' %}
+{% set plymouth_grub_regen = 'update-grub' %}
+{% set plymouth_initrd_regen = 'update-initramfs -u' %}
+
+{% set _apt_dns_probe_host = 'archive.ubuntu.com' %}
+{% set _apt_no_bloat_pkgs = [
+  "nvidia-*", "linux-firmware-*", "firmware-iwlwifi", "firmware-atheros",
+  "firmware-brcm80211", "firmware-libertas", "firmware-misc-nonfree",
+  "firmware-realtek", "firmware-amd-graphics", "hpijs-ppds", "hplip*",
+] %}
+
+{% set dconf_wallpaper_find = 'ls /usr/share/backgrounds/*-final-ubuntu.png /usr/share/backgrounds/ubuntu-default-*.png /usr/share/backgrounds/warty-final-ubuntu.png 2>/dev/null | head -1' %}
+{% set shell_theme_name = 'Yaru-dark' %}
+{# Sound theme: Ubuntu ships yaru-theme-sound and its 10_ubuntu-settings
+   gschema.override already defaults org.gnome.desktop.sound theme-name to
+   'Yaru'. Writing the system dconf db with a hardcoded 'freedesktop' silently
+   overrode that (system-db:local wins for any key the per-user db has not
+   set), so every fresh boot got the freedesktop theme. Set the distro-appropriate
+   name here and let _dconf_common.j2 interpolate it. #}
+{% set sound_theme_name = 'Yaru' %}
+{# ding@rastersoft.com (desktop icons) ships in gnome-shell-ubuntu-extensions on
+   Ubuntu, already in _apt_core_pkgs -- so install permission and the dconf
+   enablement must be set together, and it is. #}
+{% set install_desktop_icons = true %}
+{# Ubuntu keeps its STOCK dock: ubuntu-dock@ubuntu.com is force-enabled by   #}
+{# /usr/share/gnome-shell/modes/ubuntu.json (session mode), independent of   #}
+{# our dconf list. Installing dash-to-dock as well would enable two separate  #}
+{# dock UUIDs at once, so Ubuntu neither installs nor enables it. Gentoo has  #}
+{# no session-mode dock, so it does -- hence the gate is per-distro.         #}
+{% set install_dash_to_dock = false %}
+{# gdm3 reads /etc/gdm3/custom.conf on Ubuntu (the base template defaults to #}
+{# /etc/gdm/custom.conf, which is the Gentoo/systemd-gdm path).              #}
+{% set gdm_conf_path = '/etc/gdm3/custom.conf' %}
+
+{# _apt_core_pkgs: NOTE gnome-software -- NOT pulled in by
+   ubuntu-desktop-minimal on 26.04 (the seed ships the snap-store snap instead,
+   and that snap's launch/store UI is what the snag list flagged as broken).
+   Installed as a native deb explicitly -- apt plugins (snap/flatpak) come as
+   Recommends -- and asserted in verify_gate_apt so it can never silently
+   vanish again. No comments inside the set below: Jinja blocks don't accept
+   them. #}
+{% set _apt_core_pkgs = [
+  "gdm3",
+  "gnome-themes-extra",
+  "fonts-firacode",
+  "xdg-desktop-portal-gnome",
+  "plymouth",
+  "sound-theme-freedesktop",
+  "yaru-theme-sound",
+  "gnome-text-editor",
+  "yelp",
+  "gnome-calendar",
+  "gnome-calculator",
+  "gnome-characters",
+  "gnome-clocks",
+  "gnome-sound-recorder",
+  "gnome-disk-utility",
+  "gnome-shell-extensions",
+  "gnome-shell-ubuntu-extensions",
+  "gnome-software",
+  "gnome-snapshot",
+  "gnome-tweaks",
+  "gnome-weather",
+  "geary",
+  "evolution",
+  "totem",
+  "pipewire",
+  "pipewire-pulse",
+  "pipewire-alsa",
+  "pipewire-jack",
+  "wireplumber",
+  "libspa-0.2-bluetooth",
+  "rtkit",
+  "bluez",
+  "usbutils",
+  "gvfs-backends",
+  "flatpak",
+  "snapd",
+  "mesa-vulkan-drivers",
+  "mesa-common-dev",
+  "mesa-utils",
+  "vulkan-tools",
+  "glmark2-es2-wayland",
+  "glmark2-wayland",
+  "epiphany-browser",
+  "rclone",
+  "fastfetch",
+  "git",
+  "nano",
+  "net-tools",
+  "loupe",
+  "papers",
+  "python3.14-venv",
+  "lsb-release",
+  "curl",
+  "unzip",
+] %}
+
+{% set _apt_pkgs = [
+    "ubuntu-desktop-minimal",
+    "ubuntu-wallpapers",
+    "plymouth-theme-spinner",
+] %}
+
+{% block bootcmd %}
+  - [ cloud-init-per, once, disable-needrestart, bash, -c,
+      "{ date -Iseconds; echo '=== bootcmd: disable-needrestart ==='; set -ex;
+         rm -f /etc/needrestart/needrestart.conf 2>/dev/null || true;
+         echo 'needrestart config removed (uses non-interactive defaults)';
+         date -Iseconds;
+      } >>/var/log/cloud-init-bootcmd.log 2>&1" ]
+  - [ cloud-init-per, once, fix-dns, bash, -c,
+      "{ date -Iseconds; echo '=== bootcmd: fix-dns ==='; set -ex;
+         if ! getent hosts {{ _apt_dns_probe_host }} >/dev/null 2>&1; then
+           rm -f /etc/resolv.conf;
+           printf 'nameserver 8.8.8.8\\nnameserver 1.1.1.1\\n' > /etc/resolv.conf;
+           chmod 644 /etc/resolv.conf;
+           echo 'DNS fixed -- wrote static resolv.conf';
+         else
+           echo 'DNS working -- no fix needed';
+         fi;
+         date -Iseconds;
+      } >>/var/log/cloud-init-bootcmd.log 2>&1" ]
+  - [ cloud-init-per, once, exclude-firmware-printing, bash, -c,
+      "{ date -Iseconds; echo '=== bootcmd: exclude-firmware-printing ==='; set -ex;
+         printf 'Package: {{ _apt_no_bloat_pkgs | join(' ') }}\\nPin: release *\\nPin-Priority: -1\\n' > /etc/apt/preferences.d/99-no-bloat.pref;
+          echo 'Pin policy installed';
+          date -Iseconds;
+       } >>/var/log/cloud-init-bootcmd.log 2>&1" ]
+  - [ cloud-init-per, once, apt-no-langs, bash, -c,
+      "{ date -Iseconds; echo '=== bootcmd: apt-no-langs ==='; set -ex;
+         printf 'Acquire::Languages \"none\";\\n' > /etc/apt/apt.conf.d/99-no-language-downloads;
+         echo 'apt translations download disabled';
+         date -Iseconds;
+      } >>/var/log/cloud-init-bootcmd.log 2>&1" ]
+  - [ cloud-init-per, once, generate-en-locales, bash, -c,
+      "{ date -Iseconds; echo '=== bootcmd: generate-en-locales ==='; set -ex;
+          sed -i 's/^# \\(en_ZA\\.UTF-8 UTF-8\\)/\\1/; s/^# \\(en_GB\\.UTF-8 UTF-8\\)/\\1/; s/^# \\(en_US\\.UTF-8 UTF-8\\)/\\1/' /etc/locale.gen;
+          locale-gen;
+          echo 'en_ZA + en_GB + en_US locales generated';
+          date -Iseconds;
+      } >>/var/log/cloud-init-bootcmd.log 2>&1" ]
+  - [ cloud-init-per, once, google-chrome-repo, bash, -c,
+      "{ date -Iseconds; echo '=== bootcmd: google-chrome-repo ==='; set -ex;
+         mkdir -p /usr/share/keyrings;
+         python3 -c 'import urllib.request,base64; d=urllib.request.urlopen(\"https://dl.google.com/linux/linux_signing_key.pub\").read().decode(); b=d.split(\"-----\")[2]; b=\"\".join(x for x in b.splitlines() if x and not x.startswith(\"=\") and \":\" not in x); open(\"/usr/share/keyrings/google-chrome.gpg\",\"wb\").write(base64.b64decode(b))' || true;
+         printf 'deb [arch={{ 'arm64' if GUEST_ARCH == 'aarch64' else 'amd64' }} signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main\\n' > /etc/apt/sources.list.d/google-chrome.list;
+         echo 'Google Chrome repo registered';
+         date -Iseconds;
+      } >>/var/log/cloud-init-bootcmd.log 2>&1" ]
+{% endblock %}
+
+{% block pre_runcmd %}
+  - [ sh, -c, "systemctl disable --now systemd-networkd.service systemd-networkd.socket 2>/dev/null || true; rm -f /etc/systemd/network/*.network 2>/dev/null || true; systemctl enable --now NetworkManager.service || true" ]
+{% endblock %}
+
+{% block packages %}
+{% for p in guest_agent_packages %}
+  - {{ p }}
+{% endfor %}
+{% for p in _apt_core_pkgs %}
+  - {{ p }}
+{% endfor %}
+{% for p in _apt_pkgs %}
+  - {{ p }}
+{% endfor %}
+{% endblock %}
+
+{% block post_runcmd %}
+  - [ sh, -c, "apt-get update 2>&1 | tail -5 || true" ]
+  - [ sh, -c, "dpkg -l gdm3 2>/dev/null | grep -q '^ii' || { echo 'WARN: gdm3 not installed -- attempting reinstall'; apt-get install -y gdm3 2>&1 | tail -5 || true; }; systemctl enable --now gdm3.service 2>&1 || true" ]
+  {% include '_dconf_common.j2' %}
+  {% include '_plymouth_common.j2' %}
+  {% include '_app_platforms_common.j2' %}
+  {% include '_gs_extensions_common.j2' %}
+  # ---- Firefox: hard removal ----
+  # Firefox is no longer part of the curated app set. It arrives by TWO
+  # independent paths, so the removal has to be explicit: (1) the template
+  # packages: list (removed above), and (2) ubuntu-desktop-minimal
+  # Recommends: firefox, which apt would otherwise pull straight back in on
+  # the next upgrade. purge (not just remove) also drops the config dir.
+  # The apt shim installs the real browser as a SNAP, so `snap remove firefox`
+  # is required as well.
+  # NO inline `#` comments inside the scalar below -- YAML folds the scalar to
+  # one line and a mid-line `#` would comment out the rest of the script.
+  - [ bash, -c,
+      "{ date -Iseconds; echo '=== post_runcmd: remove firefox ==='; set -x;
+         if apt-get purge -y 'firefox*' 2>&1 | tail -4; then echo 'FIREFOX-PURGE-OK: firefox apt packages purged'; else echo 'FIREFOX-PURGE-FAIL: apt purge returned non-zero'; fi;
+         snap remove firefox 2>&1 | tail -2 || echo 'FIREFOX-SNAPSKIP: no firefox snap to remove';
+         if dpkg -l 2>/dev/null | grep -q '^ii.*firefox'; then echo 'FIREFOX-CHECK-FAIL: firefox still installed after purge'; else echo 'FIREFOX-CHECK-OK: no firefox package remains'; fi;
+         date -Iseconds;
+      } >>/var/log/cloud-init-output.log 2>&1" ]
+  # ---- Snap packages: bing-wall ----
+  # snap-store is deliberately NOT installed (the curated app set uses
+  # gnome-software + Flathub instead). experimental.user-daemons is still set
+  # because bing-wall needs it to run as a user daemon.
+  # Each step tests its real rc and prints a truthful marker -- the old
+  # `snap install ... | tail -3 || echo FAIL` masked failures because the
+  # pipeline's rc was tail's, which is always 0.
+  # `snap set` runs as root (the post_runcmd user), which is where it needs to
+  # be -- doing it as a non-root user without sudo fails with access denied.
+  # NO inline `#` comments inside the scalar (YAML folds it to one line and a
+  # mid-line `#` comments out the rest of the script).
+  - [ bash, -c,
+      "{ date -Iseconds; echo '=== post_runcmd: install snaps ==='; set -ex;
+         systemctl enable --now snapd.socket 2>&1 | tail -2 || true;
+         snap wait system seed.loaded || true;
+         if snap set system experimental.user-daemons=true > /tmp/snap-feature.log 2>&1; then echo 'SNAP-USERDAEMONS-OK'; else echo 'SNAP-USERDAEMONS-FAIL'; tail -2 /tmp/snap-feature.log; fi;
+         if timeout 900 snap install bing-wall > /tmp/bingwall-install.log 2>&1; then echo 'BINGWALL-OK: bing-wall installed'; else echo 'BINGWALL-FAIL: bing-wall did not install'; tail -3 /tmp/bingwall-install.log; fi;
+         if snap list 2>/dev/null | awk '{print $1}' | grep -qx bing-wall; then echo 'SNAPS-OK: bing-wall installed'; else echo 'SNAPS-MISSING: bing-wall absent (see above)'; fi;
+         date -Iseconds;
+      } >>/var/log/cloud-init-output.log 2>&1" ]
+  # ---- Custom mesa from fork: replace distro mesa with miles.buckton fork ----
+  # The guest-side venus (virtio) and virgl Vulkan/GL drivers are required for
+  # the QEMU fork's venus=on path.  Ubuntu 26.04 lacks apt-get build-dep mesa
+  # support, so build deps are installed explicitly.
+  # The build lives in /var/cache/mesa-fork (not /tmp, which systemd-tmpfiles
+  # may purge mid-build).  ERR trap ensures MESA-FORK-FAIL on any failure.
+  # On success a marker file is written and checked by the verify block below
+  # so a silently-skipped mesa build can no longer masquerade as a good build.
+  #
+  # GALLIUM/VULKAN DRIVER SET. This used to build
+  # -Dgallium-drivers=virgl -Dllvm=disabled -Dvulkan-drivers=virtio, i.e. NO
+  # llvmpipe/swrast. Correct for virgl+venus, but it silently dropped the
+  # SOFTWARE Vulkan device: the user reported `vulkaninfo --summary` showed
+  # GPU0 venus only on Ubuntu, while Gentoo -- whose fork build is
+  # -Dgallium-drivers=virgl,llvmpipe -Dvulkan-drivers=swrast,virtio -- showed
+  # GPU1 llvmpipe as well. On Ubuntu the fork REPLACES the distro mesa, so a
+  # fork built without swrast leaves no software Vulkan device at all (the apt
+  # libvulkan_lvp.so that previously provided it is part of the mesa the fork
+  # overwrites). Two things fix it, both below:
+  #   1. build the fork WITH llvmpipe+swrast (-Dgallium-drivers=virgl,llvmpipe
+  #      -Dllvm=enabled -Dshared-llvm=enabled -Dvulkan-drivers=swrast,virtio),
+  #      matching Gentoo's MESA_ARGS exactly;
+  #   2. do NOT delete the software ICD afterwards -- see the note below.
+  #
+  # LLVM: llvmpipe is a JIT, so gallium llvmpipe needs LLVM (meson fails the
+  # configure step otherwise). Ubuntu already ships
+  # /usr/lib/aarch64-linux-gnu/libLLVM.so.21.1 (libllvm21) and its packaged
+  # libvulkan_lvp.so declares NEEDED libLLVM.so.21.1, so the runtime is there;
+  # llvm-dev + libclang-cpp-dev are added to the build-deps line so the headers
+  # are too. -Dshared-llvm=enabled links the SYSTEM libLLVM instead of building
+  # a private copy inside mesa, so this costs no extra toolchain build time.
+  #
+  # ICD REGISTRY: mesa's own installer writes one JSON manifest per built
+  # Vulkan driver into /usr/share/vulkan/icd.d (swrast ->
+  # lvp_icd.<arch>.json pointing at libvulkan_lvp.so; virtio ->
+  # virtio_icd.<arch>.json), so building swrast also REGISTERS it. The old code
+  # then ran `rm -f /usr/share/vulkan/icd.d/lvp_icd.json`, deleting the software
+  # device's registration right after the fork wrote it -- the loader then saw
+  # only virtio_icd.* and `vulkaninfo --summary` listed a single GPU. Building
+  # llvmpipe was therefore never even attempted, and the rm made sure the
+  # distro's software driver could not fill the gap either.
+  # The DISTRO's bare-name manifests are still deleted -- for BOTH drivers the
+  # fork builds. apt's mesa-vulkan-drivers ships
+  # /usr/share/vulkan/icd.d/lvp_icd.json    (bare 'libvulkan_lvp.so') and
+  # /usr/share/vulkan/icd.d/virtio_icd.json (bare 'libvulkan_virtio.so'), both
+  # resolved against the default search path -- i.e. against the very libraries
+  # the fork just overwrote in /usr/lib/aarch64-linux-gnu. Once the fork also
+  # registers lvp_icd.<arch>.json / virtio_icd.<arch>.json, the loader sees TWO
+  # live manifests per driver and enumerates each device twice.
+  # That is the user-reported symptom for virtio: `vulkaninfo --summary` listed
+  # THREE GPUs -- venus, venus (byte-identical, same deviceUUID), llvmpipe --
+  # because this block only ever removed the lavapipe bare name, so
+  # virtio_icd.json kept loading libvulkan_virtio.so under a second ICD handle.
+  # THE DELETED FILENAMES MUST BE EXACT AND BARE, NEVER A GLOB: 'lvp_icd*' /
+  # 'virtio_icd*' would also delete the fork's own arch-suffixed files and
+  # re-create the venus-only vulkaninfo bug this block exists to fix. ORDER
+  # MATTERS TOO: the rm runs AFTER `ninja install` (which writes the
+  # arch-suffixed files); the original destructive rm ran before it, which is
+  # exactly why virtio_icd.aarch64.json survived that rm while lvp_icd.json did
+  # not.
+  # Afterwards the block ASSERTS, for EACH driver, that exactly one registration
+  # survives and that it is the fork's arch-suffixed file, and fails loudly
+  # otherwise. The SWRAST-VULKAN-OK gate in the verify block below re-checks the
+  # same invariant on the shipped image.
+  # NOTE: no '#' inline comments inside the bash -c scalar below -- the YAML
+  # folded scalar joins every line into one, so a '#' comments out everything
+  # to the end of the block (including its closing brace).  That bug made this
+  # whole entry fail with "syntax error: unexpected end of file from '{'".
+  - [ bash, -c,
+      "{ date -Iseconds; echo '=== post_runcmd: build custom mesa ===';
+         set -euo pipefail;
+         MESA_LOG=/var/log/mesa-fork-build.log;
+         trap 'echo \"MESA-FORK-FAIL: build failed (see $MESA_LOG)\" >&2; exit 1' ERR;
+         echo \"--- build started at $(date -Iseconds) ---\" >$MESA_LOG;
+         if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+           sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources;
+         fi;
+         apt-get update >>$MESA_LOG 2>&1;
+         echo '--- installing build tools ---' >>$MESA_LOG;
+         DEBIAN_FRONTEND=noninteractive apt-get install -y \
+           python3-pip python3-venv cmake ninja-build pkgconf \
+            python3-mako python3-pycparser bison flex \
+           libdrm-dev libgbm-dev libegl-dev libgl-dev libgles-dev \
+           libglvnd-core-dev libglvnd-dev libegl1-mesa-dev libgles2-mesa-dev \
+            libwayland-dev libwayland-egl-backend-dev wayland-protocols \
+           libx11-dev libx11-xcb-dev libxcb-dri2-0-dev libxcb-dri3-dev \
+           libxcb-glx0-dev libxcb-present-dev libxcb-randr0-dev libxcb-shm0-dev \
+           libxcb-sync-dev libxext-dev libxrandr-dev libxshmfence-dev libxxf86vm-dev \
+            x11proto-dev libvulkan-dev glslang-tools \
+           libdisplay-info-dev zlib1g-dev libzstd-dev libsensors-dev libexpat1-dev libpng-dev \
+           llvm-dev libclang-cpp-dev \
+           rustc cargo >>$MESA_LOG 2>&1 || true;
+         echo '--- installing meson+ninja via pip ---' >>$MESA_LOG;
+         pip3 install --break-system-packages meson 2>&1 | tail -3 >>$MESA_LOG || \
+           pip3 install meson 2>&1 | tail -3 >>$MESA_LOG || true;
+         which meson >>$MESA_LOG 2>&1 || { echo 'MESA-FORK-FAIL: meson not available after pip install' >&2; exit 1; };
+         which ninja >>$MESA_LOG 2>&1 || which ninja-build >>$MESA_LOG 2>&1 || true;
+         MESA_DIR=/var/cache/mesa-fork;
+         git clone --depth 1 --branch main https://gitlab.freedesktop.org/miles.buckton/mesa.git $MESA_DIR >>$MESA_LOG 2>&1;
+         cd $MESA_DIR;
+         rm -rf builddir;
+         meson setup builddir --prefix=/usr -Dlibdir=/usr/lib/aarch64-linux-gnu \
+            -Dplatforms=x11,wayland -Dgallium-drivers=virgl,llvmpipe \
+            -Dllvm=enabled -Dshared-llvm=enabled -Dvulkan-drivers=swrast,virtio \
+            -Dbuildtype=release >>$MESA_LOG 2>&1;
+         ninja -C builddir -j$(nproc) >>$MESA_LOG 2>&1;
+         ninja -C builddir install >>$MESA_LOG 2>&1;
+         ldconfig;
+         rm -f /usr/share/vulkan/icd.d/lvp_icd.json /usr/share/vulkan/icd.d/virtio_icd.json;
+         for ICD in 'libvulkan_lvp.so:lavapipe' 'libvulkan_virtio.so:venus'; do
+           ICD_LIB=${ICD%%:*};
+           ICD_DEV=${ICD##*:};
+           ICD_N=$(grep -rl \"$ICD_LIB\" /usr/share/vulkan/icd.d/ 2>/dev/null | wc -l || true);
+           if [ \"$ICD_N\" -ne 1 ]; then
+             echo \"MESA-FORK-FAIL: expected exactly 1 $ICD_DEV ICD registration ($ICD_LIB), found $ICD_N -- a stale bare-name apt manifest survives, so vulkaninfo would list the $ICD_DEV device twice\" >&2;
+             exit 1;
+           fi;
+           if grep -rl \"$ICD_LIB\" /usr/share/vulkan/icd.d/ 2>/dev/null | grep -qv 'aarch64'; then
+             echo \"MESA-FORK-FAIL: surviving $ICD_DEV ICD is the bare apt name, not the fork arch-suffixed one\" >&2;
+             exit 1;
+           fi;
+         done;
+         if [ -f /usr/lib/aarch64-linux-gnu/libvulkan_lvp.so ]; then
+           if grep -rl 'libvulkan_lvp.so' /usr/share/vulkan/icd.d/ >/dev/null 2>&1; then
+             echo 'MESA-FORK-SWRAST-ICD: lavapipe ICD registered (llvmpipe software Vulkan device present)' ;
+           else
+             echo 'MESA-FORK-FAIL: libvulkan_lvp.so built but no ICD JSON registers it -- vulkaninfo will show venus only' >&2 ;
+             exit 1 ;
+           fi ;
+         fi ;         if ! ls /usr/lib/aarch64-linux-gnu/libgallium-*.so >/dev/null 2>&1; then
+            echo 'MESA-FORK-FAIL: fork libgallium missing after build' >&2;
+            exit 1;
+          fi;
+         touch /var/lib/mesa-fork-installed;
+         echo 'MESA-FORK-OK: custom mesa installed from miles.buckton fork (virgl + llvmpipe gallium, swrast + virtio Vulkan)';
+         date -Iseconds;
+      } >>/var/log/cloud-init-output.log 2>&1" ]
+{% endblock %}
+
+{% block simulate_install %}
+  - [ sh, -c, "set -e ;
+      for i in 1 2 3; do apt-get update >/dev/null 2>&1 && break; sleep $((i * 5)); done || true ;
+      PKGS=$(tr '\\n' ' ' < /etc/install-simulate-pkgs.txt) ;
+      if apt-get install --simulate -y $PKGS > /var/log/install-simulate.log 2>&1 ; then
+        echo 'SIMULATE-OK: apt resolver passed for full target list' ;
+      else
+        echo 'SIMULATE-FAIL: apt resolver could not satisfy the target list (see /var/log/install-simulate.log for details)' ;
+        tail -40 /var/log/install-simulate.log ;
+        exit 1 ;
+      fi" ]
+{% endblock %}
+
+{% block extra_write_files %}
+{% if simulate_only %}
+  - path: /etc/install-simulate-pkgs.txt
+    permissions: "0644"
+    content: |
+{% for p in guest_agent_packages %}
+      {{ p }}
+{% endfor %}
+{% for p in _apt_core_pkgs %}
+      {{ p }}
+{% endfor %}
+{% for p in _apt_pkgs %}
+      {{ p }}
+{% endfor %}
+      google-chrome-stable
+{% endif %}
+{% endblock %}
+
+{% block verify %}
+  # Mesa-fork gate: must run BEFORE the shared VERIFY-OK echo so a missing
+  # mesa build can never coexist with a VERIFY-OK success marker.
+  # The second half of this gate checks the SOFTWARE Vulkan device is both
+  # built and REGISTERED. `vulkaninfo --summary` on a healthy Ubuntu VM lists
+  # two GPUs (venus then llvmpipe); a build that ships only venus is missing
+  # the software fallback apps use when they cannot create a venus device.
+  # Guard the loader-visible FACTS (the .so plus its ICD JSON), not
+  # `vulkaninfo`: the marker gate below already proves the build ran, and a
+  # vulkaninfo run inside a verify block would try to talk to a display.
+  - [ sh, -c, "test -f /var/lib/mesa-fork-installed || { echo 'VERIFY-FAIL: mesa-fork build did not complete (missing /var/lib/mesa-fork-installed)' >&2 ; exit 1 ; } ; echo 'MESA-FORK-VERIFIED: marker present'" ]
+  - [ sh, -c, "set -e ; fail() { echo \"VERIFY-FAIL: $1\" >&2 ; touch /var/log/verify-gate-fail ; exit 1 ; } ;
+      test -f /usr/lib/aarch64-linux-gnu/libvulkan_lvp.so || fail 'software Vulkan driver (libvulkan_lvp.so) missing -- fork mesa was built without swrast' ;
+      grep -rl 'libvulkan_lvp.so' /usr/share/vulkan/icd.d/ >/dev/null 2>&1 || fail 'lavapipe ICD not registered -- vulkaninfo would list venus only, no software Vulkan device' ;
+      for L in libvulkan_lvp.so libvulkan_virtio.so ; do
+        N=$(grep -rl \"$L\" /usr/share/vulkan/icd.d/ 2>/dev/null | wc -l) ;
+        test \"$N\" -eq 1 || fail \"$N ICD manifests register $L -- vulkaninfo would list that GPU $N times (stale bare-name apt manifest?)\" ;
+      done ;
+      echo 'SWRAST-VULKAN-OK: llvmpipe software Vulkan device built + registered, no Vulkan device double-registered'" ]
+  # pryhard-remove gate: firefox arrived twice (packages: list and
+  # ubuntu-desktop-minimal Recommends). If either path is still live, fail here.
+  # A purge-only check with `dpkg -l | grep` alone would pass while the firefox
+  # SNAP still lingered, so the snap is checked too.
+  - [ sh, -c, "set -e ; fail() { echo \"VERIFY-FAIL: $1\" >&2 ; touch /var/log/verify-gate-fail ; exit 1 ; } ;
+      if dpkg -l 2>/dev/null | grep -q '^ii.*firefox'; then fail 'firefox apt package still installed' ; else echo 'FIREFOX-CHECK-OK: no firefox package remains' ; fi ;
+      if snap list 2>/dev/null | awk '{print $1}' | grep -qx firefox; then fail 'firefox snap still installed' ; else echo 'FIREFOX-SNAP-OK: no firefox snap remains' ; fi" ]
+  # App-set gate: the packages the snag list reported missing. Each one has
+  # bitten before by being absent while core GNOME looked fine.
+  # Both glmark2 Wayland flavours are asserted, not just glmark2-es2-wayland:
+  # the reported snag was that `glmark2-wayland` was absent on Ubuntu while
+  # present on Gentoo, and a one-package gate would have passed the whole time.
+  - [ sh, -c, "set -e ; fail() { echo \"VERIFY-FAIL: $1\" >&2 ; touch /var/log/verify-gate-fail ; exit 1 ; } ;
+      for p in gnome-sound-recorder evolution gnome-clocks gnome-calendar glmark2-es2-wayland glmark2-wayland; do
+        dpkg -l $p 2>/dev/null | grep -q '^ii' || fail \"$p missing\" ;
+      done ;
+      echo 'APPSET-VERIFIED: recorder, evolution, clocks, calendar, glmark2-es2-wayland, glmark2-wayland present'" ]
+  # Sound theme + desktop icons gates: the sound theme was wrong because the
+  # template wrote freedesktop over Ubuntu's Yaru gschema override; ding (desktop
+  # icons) must be both installed and enabled.
+  # Sound theme + desktop icons gates: the sound theme was wrong because the
+  # template wrote freedesktop over Ubuntu's Yaru gschema override; ding (desktop
+  # icons) must be both installed and enabled.
+  # The gschema grep is deliberately whitespace-tolerant: the shipped override
+  # writes `theme-name = 'Yaru'` (spaces around '='), so a literal
+  # `theme-name='Yaru'` never matches and reports a missing override on a
+  # perfectly good build -- measured live on a built VM. What is actually
+  # asserted is the effective value (`dconf read`), which is what the user hears.
+  - [ sh, -c, "set -e ; fail() { echo \"VERIFY-FAIL: $1\" >&2 ; touch /var/log/verify-gate-fail ; exit 1 ; } ;
+      dpkg -l yaru-theme-sound 2>/dev/null | grep -q '^ii' || fail 'yaru-theme-sound missing' ;
+      grep -qE 'theme-name[[:space:]]*=[[:space:]]*.Yaru.' /usr/share/glib-2.0/schemas/10_ubuntu-settings.gschema.override 2>/dev/null || echo 'SOUNDTHEME-WARN: 10_ubuntu-settings.gschema.override does not name Yaru on this release -- relying on the effective dconf value below' ;
+      dconf read /org/gnome/desktop/sound/theme-name 2>/dev/null | grep -q \"'Yaru'\" || fail 'system dconf sound theme is not Yaru (the dconf db write or the user db has overridden it)' ;
+      echo 'SOUNDTHEME-OK: Yaru active' ;
+      dpkg -l gnome-shell-ubuntu-extensions 2>/dev/null | grep -q '^ii' || fail 'gnome-shell-ubuntu-extensions missing (ding not installed)' ;
+      dconf read /org/gnome/shell/enabled-extensions 2>/dev/null | grep -q 'ding@rastersoft' || fail 'ding not in enabled-extensions (no desktop icons)' ;
+      echo 'DESKTOPICONS-OK: ding installed + enabled'" ]
+{{ verify_gate_apt() }}
+{% endblock %}

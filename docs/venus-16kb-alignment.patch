@@ -1,0 +1,27 @@
+diff --git a/src/virtio/vulkan/vn_renderer_virtgpu.c b/src/virtio/vulkan/vn_renderer_virtgpu.c
+--- a/src/virtio/vulkan/vn_renderer_virtgpu.c
++++ b/src/virtio/vulkan/vn_renderer_virtgpu.c
+@@ -636,7 +636,7 @@ static uint32_t virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
+                                    uint64_t blob_id,
+                                    uint32_t *res_id)
+ {
+-   blob_size = align64(blob_size, 4096);
++   blob_size = align64(blob_size, 16384);  /* 16KB for Apple Silicon page alignment */
+ 
+    struct drm_virtgpu_resource_create_blob args = {
+       .blob_mem = blob_mem,
+diff --git a/src/virtio/vulkan/vn_renderer_util.c b/src/virtio/vulkan/vn_renderer_util.c
+--- a/src/virtio/vulkan/vn_renderer_util.c
++++ b/src/virtio/vulkan/vn_renderer_util.c
+@@ -113,8 +113,10 @@ vn_renderer_shmem_pool_alloc(struct vn_renderer *renderer,
+    }
+ 
+    struct vn_renderer_shmem *shmem = vn_renderer_shmem_ref(renderer, pool->shmem);
+-   *out_offset = pool->used;
+-   pool->used += size;
++   *out_offset = (pool->used + 16383) & ~16383;  /* Round up to 16KB for Apple Silicon */
++   size = (size + 16383) & ~16383;  /* Round up to 16KB for Apple Silicon */
++   pool->used = *out_offset + size;
+    mtx_unlock(&pool->mutex);
+ 
+    return shmem;
