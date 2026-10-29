@@ -1,0 +1,40 @@
+{# ---------------------------------------------------------------------- #}
+{# Plymouth boot splash -- makes each VM boot with its distro's real,     #}
+{# branded splash (like a real ISO install) instead of a bare text boot.  #}
+{#                                                                        #}
+{# Include INSIDE a runcmd block (pre_runcmd / post_runcmd) AFTER the     #}
+{# desktop + plymouth packages are installed. Best-effort: this is pure   #}
+{# cosmetics, so every step is `|| true` and the whole block is logged to #}
+{# /var/log/plymouth-setup.log -- a failure here must NEVER fail the VM   #}
+{# build.                                                                 #}
+{#                                                                        #}
+{# Per-distro knobs (set with {% set %} in the concrete template, same    #}
+{# pattern as dconf_wallpaper_find):                                      #}
+{#   plymouth_theme        -- theme name to make the default ('' skips)   #}
+{#   plymouth_set_theme    -- full command that sets the default theme;   #}
+{#                            defaults to `plymouth-set-default-theme     #}
+{#                            <plymouth_theme>` (Ubuntu overrides with    #}
+{#                            update-alternatives, which is the distro    #}
+{#                            mechanism)                                  #}
+{#   plymouth_grub_var     -- GRUB variable to append the splash args to  #}
+{#                            (default GRUB_CMDLINE_LINUX_DEFAULT;         #}
+{#                            RHEL family uses GRUB_CMDLINE_LINUX)         #}
+{#   plymouth_grub_args    -- kernel-cmdline tokens, e.g. 'splash quiet'  #}
+{#   plymouth_grub_regen   -- grub.cfg regen command ('' skips)           #}
+{#   plymouth_initrd_regen -- initramfs regen command ('' skips)          #}
+{# ---------------------------------------------------------------------- #}
+  # ---- PLYMOUTH BOOT SPLASH (best-effort, ISO-like branding) ------------
+  - [ sh, -c, "{ date -Iseconds; echo '=== plymouth setup ==='; set +e; LOG=/var/log/plymouth-setup.log ;
+{% if plymouth_theme | default('') %}
+      {{ plymouth_set_theme | default('plymouth-set-default-theme ' ~ plymouth_theme) }} 2>&1 | tee -a \"$LOG\" || true ;
+{% endif %}
+{% if plymouth_grub_regen | default('') %}
+      mkdir -p /etc/default/grub.d; DROPIN=/etc/default/grub.d/50-splash.cfg;
+      if [ ! -f \"$DROPIN\" ]; then printf '{{ plymouth_grub_var | default('GRUB_CMDLINE_LINUX_DEFAULT') }}=\"${{ plymouth_grub_var | default('GRUB_CMDLINE_LINUX_DEFAULT') }} {{ plymouth_grub_args }}\"\\n' > \"$DROPIN\"; fi;
+      echo 'grub drop-in:'; cat \"$DROPIN\" | tee -a \"$LOG\";
+      {{ plymouth_grub_regen }} 2>&1 | tee -a \"$LOG\" ;
+{% endif %}
+{% if plymouth_initrd_regen | default('') %}
+      {{ plymouth_initrd_regen }} 2>&1 | tee -a \"$LOG\" ;
+{% endif %}
+      echo 'PLYMOUTH-SETUP-OK: boot splash configured' | tee -a \"$LOG\"; date -Iseconds; } 2>&1 | tee -a /var/log/cloud-init-output.log" ]

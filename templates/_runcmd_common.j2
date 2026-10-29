@@ -1,0 +1,42 @@
+  # Boot into the graphical target so the display manager actually starts.
+  - [ systemctl, set-default, graphical.target ]
+  # Display manager -- skip if the distro defers GDM enable to post_runcmd
+{% if not skip_gdm_enable | default(false) %}
+  - [ systemctl, enable, --now, {{ gdm_service | default('gdm.service') }} ]
+{% endif %}
+{% if vmtools_service %}
+  # Guest agent service (qemu-guest-agent)
+  - [ systemctl, enable, {{ vmtools_service }} ]
+{% endif %}
+{% for svc in extra_enable_services | default([]) %}
+  - [ systemctl, enable, {{ svc }} ]
+{% endfor %}
+  # Enable PipeWire stack for all users (audio doesn't auto-start otherwise
+  # -- pipewire.socket / wireplumber are user services). PER-UNIT loop, for
+  # two reasons: (1) on Gentoo this runs BEFORE gentoo-install.service has
+  # emerged pipewire (the units don't exist yet -- the real enable happens
+  # there, after the install), and (2) `systemctl --global enable A B C` is
+  # TRANSACTIONAL: one missing unit aborts the whole command with ZERO
+  # symlinks created. That exact bug left every Gentoo VM with no audio:
+  # wireplumber.service was absent (binpkg built -systemd), so the pipewire
+  # sockets silently never got enabled either. Isolating each unit keeps a
+  # partial failure from disabling the rest and leaves truthful markers.
+  - [ sh, -c, "for u in pipewire.service pipewire.socket pipewire-pulse.service pipewire-pulse.socket wireplumber.service; do systemctl --global enable \"$u\" 2>/dev/null && echo \"GLOBAL-ENABLE-OK: $u\" || echo \"GLOBAL-ENABLE-MISS: $u\"; done" ]
+  # cloud-init's timezone module writes /etc/localtime as a REGULAR FILE
+  # (observed on Gentoo: timedatectl reports "Time zone: n/a (UTC, +0000)",
+  # systemd-timedated logs "should be a symbolic link", snapd records
+  # timezone UTC, and gnome-calendar crashes with `tz != NULL` GLib
+  # assertions). This entry runs in modules:final, AFTER the timezone module,
+  # and forces the symlink. Runs on both distros; harmless where cloud-init
+  # already linked it.
+  - [ sh, -c, "if [ -e /etc/localtime ] && [ ! -L /etc/localtime ]; then ln -sf /usr/share/zoneinfo/{{ TIMEZONE }} /etc/localtime && echo 'TZ-SYMLINK-OK: /etc/localtime -> {{ TIMEZONE }}' || echo 'TZ-SYMLINK-FAIL: could not symlink /etc/localtime'; else echo 'TZ-SYMLINK-OK: localtime already a symlink'; fi" ]
+  # Default the user to a GNOME (Wayland) session
+  - [ sh, -c, "mkdir -p /var/lib/AccountsService/users" ]
+  - [ sh, -c, "printf '[User]\nSession={{ default_session | default('gnome') }}\nXSession={{ default_session | default('gnome') }}\nSystemAccount=false\n' > /var/lib/AccountsService/users/{{ USERNAME }}" ]
+  # SELinux-only fix (no-op on Ubuntu/Gentoo, which have no restorecon):
+  # the shell redirect above labels the file var_lib_t, but accounts-daemon
+  # (accountsd) is AVC-denied from reading it in enforcing mode, so
+  # org.freedesktop.Accounts fails to activate and GDM exits with "Failed
+  # to contact accountsservice" -- crash-loop / boot halt.
+  - [ sh, -c, "command -v restorecon >/dev/null 2>&1 && restorecon -R /var/lib/AccountsService 2>/dev/null || true" ]
+
