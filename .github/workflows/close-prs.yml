@@ -1,0 +1,52 @@
+name: Auto-close pull requests
+
+# This repository is a personal artifact and does not accept external
+# contributions. Any pull request opened by a non-owner is automatically
+# closed with a friendly explanatory comment. Has no effect while the
+# repo is private (nobody else can fork/PR); kicks in if/when the repo
+# is made public.
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  close:
+    runs-on: ubuntu-latest
+    # Skip when the PR author IS the repo owner -- the maintainer can
+    # still use PRs as their own merge-request workflow if they want to.
+    if: github.event.pull_request.user.login != github.repository_owner
+    steps:
+      - name: Comment and close
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const msg = [
+              "Thanks for your interest in this project! 🐧",
+              "",
+              "This repository is published as a personal artifact and does",
+              "not accept external pull requests. See [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md)",
+              "for the policy.",
+              "",
+              "The project is MIT-licensed (see [LICENSE](../blob/main/LICENSE)),",
+              "so you're encouraged to fork it freely and adapt it for your",
+              "own purposes. If you spot a bug or have an improvement, the",
+              "most useful thing you can do is fix it in your own fork.",
+              "",
+              "Closing this automatically — please don't take it personally."
+            ].join("\n");
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: msg
+            });
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              state: "closed"
+            });
