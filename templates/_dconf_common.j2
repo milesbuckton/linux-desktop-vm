@@ -1,0 +1,38 @@
+  # Set distro wallpaper + dark mode + single workspace + event sounds via system-wide dconf.
+  - [ sh, -c, "mkdir -p /etc/dconf/db/local.d /etc/dconf/profile && printf 'user-db:user\\nsystem-db:local\\n' > /etc/dconf/profile/user && WALL=$({{ dconf_wallpaper_find }}); if [ -n \"$WALL\" ]; then printf '[org/gnome/desktop/background]\\npicture-uri=\"file://%s\"\\npicture-uri-dark=\"file://%s\"\\n[org/gnome/desktop/screensaver]\\npicture-uri=\"file://%s\"\\n' \"$WALL\" \"$WALL\" \"$WALL\" > /etc/dconf/db/local.d/00-background; fi && printf '[org/gnome/desktop/interface]\\ncolor-scheme=\"prefer-dark\"\\n' > /etc/dconf/db/local.d/01-dark-mode && printf '[org/gnome/Epiphany/web]\\nenable-webextensions=true\\n' > /etc/dconf/db/local.d/02-epiphany-ext && printf '[org/gnome/mutter]\\ndynamic-workspaces=false\\n[org/gnome/desktop/wm/preferences]\\nnum-workspaces=1\\nbutton-layout=\":minimize,maximize,close\"\\n' > /etc/dconf/db/local.d/03-workspaces && printf '[org/gnome/desktop/sound]\\nevent-sounds=true\\ntheme-name=\"{{ sound_theme_name | default('freedesktop') }}\"\\n' > /etc/dconf/db/local.d/04-sound && printf '[org/gnome/shell]\\nenabled-extensions=[{% if install_desktop_icons | default(false) %}\"ding@rastersoft.com\", {% endif %}{% if install_dash_to_dock | default(true) %}\"dash-to-dock@micxgx.gmail.com\", {% endif %}\"user-theme@gnome-shell-extensions.gcampax.github.com\"]\\n' > /etc/dconf/db/local.d/05-extensions && printf '[org/gnome/shell/extensions/user-theme]\\nname=\"{{ shell_theme_name | default('Adwaita') }}\"\\n' > /etc/dconf/db/local.d/06-shell-theme && dconf update 2>&1 | tail -3 || true" ]
+  {#
+    Cross-distro UX parity, two parts:
+
+    1. button-layout ':minimize,maximize,close' (in 03-workspaces above) is
+       the EXACT value Ubuntu's :ubuntu schema variant ships -- verified in
+       /usr/share/glib-2.0/schemas/10_ubuntu-settings.gschema.override on the
+       built Ubuntu VM, section [org.gnome.desktop.wm.preferences:ubuntu].
+       Stock GNOME (both distros) defaults to 'appmenu:close', so a fresh
+       Gentoo boot had NO Minimize and NO Maximize button -- Tweaks > Windows
+       > Titlebar Buttons showed both OFF on Gentoo while Ubuntu showed both
+       ON. Both distros now get the same value: on Ubuntu the system-db value
+       matches its own variant default (identical bytes, no visible change),
+       on Gentoo it is the only source of the setting. The user's dconf db
+       still wins once they change it themselves.
+
+    2. 07-dock mirrors Ubuntu's :ubuntu dock variant
+       (10_ubuntu-dock.gschema.override) into dash-to-dock's schema on Gentoo:
+       dock LEFT (stock default BOTTOM -- the reported asymmetry), always
+       visible with dock-fixed=true (stock auto-hide), full-height panel bar
+       (extend-height), 48px icons (icon-size-fixed + dash-max-icon-size),
+       dot run indicators, scroll switches workspace, click actions match
+       Ubuntu, and the volumes/network/trash entries match the Configure Dock
+       Behavior dialog the user captured on Ubuntu. Gated on the SAME
+       install_dash_to_dock var that _gs_extensions_common.j2 gates the
+       extension install on, so "installs" and "configures" can never drift
+       apart: Ubuntu keeps its stock ubuntu-dock@ubuntu.com (which reads this
+       very schema) and renders no 07-dock at all. Every value was verified
+       against the dash-to-dock v110 gschema.xml INSTALLED on the built Gentoo
+       VM -- the enum nicks LEFT / ALL_WINDOWS / DOTS / switch-workspace /
+       focus-or-appspread / launch / minimize all exist there, so no value
+       can silently fall back to a schema default (dconf does not validate;
+       a bad nick just reads back as the default, i.e. the bug returns).
+  #}
+  {% if install_dash_to_dock | default(true) %}
+  - [ sh, -c, "printf '[org/gnome/shell/extensions/dash-to-dock]\\ndock-position=\"LEFT\"\\ndock-fixed=true\\nintellihide=true\\nintellihide-mode=\"ALL_WINDOWS\"\\nextend-height=true\\nicon-size-fixed=true\\ndash-max-icon-size=48\\ncustom-theme-shrink=true\\nrunning-indicator-style=\"DOTS\"\\nscroll-action=\"switch-workspace\"\\nclick-action=\"focus-or-appspread\"\\nshift-click-action=\"launch\"\\nmiddle-click-action=\"launch\"\\nshift-middle-click-action=\"minimize\"\\nshow-mounts=true\\nshow-mounts-only-mounted=false\\nshow-mounts-network=true\\nshow-trash=true\\ndisable-overview-on-startup=true\\n' > /etc/dconf/db/local.d/07-dock && dconf update" ]
+  {% endif %}
