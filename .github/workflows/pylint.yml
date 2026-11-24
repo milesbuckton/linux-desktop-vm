@@ -1,0 +1,86 @@
+name: Pylint
+
+# pull_request was missing: CI only ran on push, so a change proposed
+# through a PR was never linted until it landed on main. The repo has no
+# PR workflow by policy (work is committed straight to main), but the
+# trigger costs nothing and closes the hole for any future branch.
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Tracks the host interpreter (repo .venv). The fleet runs every
+        # gate under this same version, so CI must lint the interpreter
+        # the fleet actually uses -- a newer interpreter can introduce
+        # new builtins (3.15 added `sentinel`), and a W0622 that only
+        # fires there is a hard Gate 0c failure, not a nit.
+        # actions/setup-python publishes 3.15.x for linux 22.04/24.04/26.04.
+        python-version: ["3.15"]
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        # Full history so the pushed range (before..sha) resolves; the repo
+        # is tiny, so a deep clone costs nothing.
+        fetch-depth: 0
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    - name: Analysing changed code with pylint
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        BEFORE_SHA: ${{ github.event.before }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      run: |
+        set -euo pipefail
+        if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+          # Manual run = explicit request to validate everything: whole tree.
+          echo "Manual dispatch: linting every tracked Python file"
+          python scripts/lint-python.py
+          exit 0
+        fi
+        if [ "$EVENT_NAME" = "pull_request" ]; then
+          # A PR has no `before` commit of its own, but it has a base branch
+          # tip: diff against that, so the run covers what the PR changes
+          # plus everything it touched since the branch split.
+          echo "Pull request: linting Python files changed since $BASE_SHA"
+          python scripts/lint-python.py --changed-since "$BASE_SHA"
+          exit 0
+        fi
+        # push -> only the files that push changed (before..HEAD, so a
+        # multi-commit push is covered by one run). The script falls back to
+        # a full scan when the ref cannot resolve (root commit, force-push,
+        # first-push all-zero sha), so a run can never report success
+        # without having checked something.
+        echo "Push: linting Python files changed since $BEFORE_SHA"
+        python scripts/lint-python.py --changed-since "$BEFORE_SHA"
+    - name: Unit tests
+      # ALWAYS the whole suite, on every event. Unlike pylint there is no
+      # "changed files" mode: these tests assert build-verdict behaviour
+      # (cleanup of a leaked VM, the cloud-init status ladder, flag
+      # validation), so any subset can pass while the thing under test
+      # regressed. They are also the only coverage of linux_vm/fleet/.
+      run: python scripts/run-tests.py
+    - name: Template lint (Gate 0)
+      # Renders every distro in real + simulate mode, yaml-parses it,
+      # shell-lints every runcmd/bootcmd script, checks simulate-vs-real
+      # package parity, and re-renders with hostile password shapes. No
+      # network, no VM -- this is the gate that catches a template that
+      # would ship broken to an overnight fleet build.
+      run: python scripts/lint-templates.py
+    - name: Package alignment audit (Gate 0b)
+      # Cross-distro package alignment: every REQUIRED (category, distro)
+      # pair must be present in the rendered package set. This gate used to
+      # run ONLY inside the fleet orchestrator, so CI never checked it and a
+      # template that dropped a whole app category reached an overnight
+      # build unchallenged (it is exactly how the "GL benchmark" row once
+      # matched a nonexistent x11-libs/glfw atom while glmark2 was never
+      # built). No network, no VM -- it renders the templates and reads the
+      # package lists out of them.
+      run: python scripts/audit-packages.py

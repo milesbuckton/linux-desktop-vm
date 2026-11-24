@@ -1,0 +1,10 @@
+version: 2
+ethernets:
+  all-en:
+    match:
+      name: "e*"
+    dhcp4: true
+    # IPv6 is intentionally disabled: the QEMU user-net backend defaults to
+    # no RA/route, so v6 DHCP would just add a slow-lease-timeout stall to
+    # the boot. Fine for the current v4-only use case (L8).
+    dhcp6: false
